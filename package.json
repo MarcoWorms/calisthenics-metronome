@@ -1,12 +1,18 @@
 {
-  "name": "playground-tempo-trainer",
+  "name": "noskip",
   "private": true,
   "type": "module",
   "scripts": {
     "build": "tsc -p tsconfig.json",
+    "start": "node --experimental-sqlite dist/server.js",
     "typecheck": "tsc --noEmit -p tsconfig.json"
   },
+  "dependencies": {
+    "express": "^5.1.0"
+  },
   "devDependencies": {
+    "@types/express": "^5.0.3",
+    "@types/node": "^24.5.2",
     "typescript": "^5.4.0"
   }
 }

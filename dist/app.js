@@ -1,1673 +1,1760 @@
-import { trainingPrograms } from './exercises.js';
-const TRAININGS = [
-    {
-        id: 'default-training',
-        name: 'Calistenia corpo inteiro',
-        description: 'Barra fixa, barra com anilhas e colchonete.',
-        equipment: 'Barra fixa, barra com anilhas e colchonete.',
-        programKey: 'intensive',
-        difficulty: 2
-    },
-    {
-        id: 'home-training',
-        name: 'Treino em casa',
-        description: '45s de exercício · 15s de pausa · sem equipamento.',
-        equipment: 'Sem equipamento.',
-        programKey: 'home',
-        difficulty: 1
-    },
-    {
-        id: 'core-training',
-        name: 'Abdômen 8 min',
-        description: '60s por exercício · sem pausa.',
-        equipment: 'Sem equipamento.',
-        programKey: 'core',
-        difficulty: 1
-    },
-    {
-        id: 'stretch-training',
-        name: 'Alongamento',
-        description: '30s por exercício · sem pausa.',
-        equipment: 'Sem equipamento.',
-        programKey: 'stretch',
-        difficulty: 1
-    },
-    {
-        id: 'flash-training',
-        name: 'Treino iniciante flash',
-        description: '10 movimentos de 60s + aquecimento · pausa de 2s.',
-        equipment: 'Sem equipamento.',
-        programKey: 'flash',
-        difficulty: 1
-    },
-    {
-        id: 'test-training-easy',
-        name: 'Treino teste curto (fácil)',
-        description: 'Sequência curta para validar telas · XP x1.',
-        equipment: 'Sem equipamento.',
-        programKey: 'test',
-        difficulty: 1
-    },
-    {
-        id: 'test-training-medium',
-        name: 'Treino teste curto (intermediário)',
-        description: 'Sequência curta para validar telas · XP x2.',
-        equipment: 'Sem equipamento.',
-        video: {
-            src: 'videos/portrait.MOV',
-            orientation: 'portrait'
-        },
-        programKey: 'test',
-        difficulty: 2
-    },
-    {
-        id: 'test-training-hard',
-        name: 'Treino teste curto (difícil)',
-        description: 'Sequência curta para validar telas · XP x3.',
-        equipment: 'Sem equipamento.',
-        video: {
-            src: 'videos/landscape.MOV',
-            orientation: 'landscape'
-        },
-        programKey: 'test',
-        difficulty: 3
+import { squatTraining } from './session-data.js';
+import { getFmsSessionsForUser, getActiveUser, getProfileStats, getSessionsForUser, loginUser, logoutUser, recordPageVisit, registerUser, saveFmsSession, saveSession, updateSexForTSPU } from './storage.js';
+import { computeFmsOutcome, createEmptyFmsPatterns, createFmsTasks, fmsDisclaimer, fmsEquipmentNotes, fmsOpeningVoice, fmsRequiredEquipment, fmsVoiceDisclaimer, getFmsPatternName } from './fms-data.js';
+import { FMS_POSE_CONNECTIONS, FmsTaskAnalyzer } from './fms-mediapipe.js';
+import { SquatSessionEngine } from './squat-engine.js';
+import { VoiceCoach } from './voice-coach.js';
+function loadBrowserSessionId() {
+    const storageKey = 'noskip_browser_session_id';
+    try {
+        const existing = window.sessionStorage.getItem(storageKey)?.trim();
+        if (existing)
+            return existing;
+        const next = window.crypto.randomUUID();
+        window.sessionStorage.setItem(storageKey, next);
+        return next;
     }
-];
-const HISTORY_STORAGE_KEY = 'calisthenics-history';
-const XP_RATE = 1;
-const PREP_DELAY_SECONDS = 5;
-const NO_TIPS_MESSAGE = 'Sem dicas adicionais para este exercício.';
-const EXIT_TRAINING_MESSAGE = 'Tem certeza que vc quer sair do treino? Seu progresso sera perdido.';
-const SWIPE_THRESHOLD_PX = 70;
-const SWIPE_DOMINANCE_RATIO = 1.2;
-const SHARE_CARD_WIDTH = 1080;
-const SHARE_CARD_HEIGHT = 1350;
-const state = {
-    programKey: 'intensive',
-    selectedTrainingId: null,
-    schedule: [],
-    pointer: 0,
-    status: 'idle',
-    segmentDurationMs: 0,
-    remainingMs: 0,
-    completedMs: 0,
-    animationId: null,
-    lastCountdownSecond: null,
-    audioCtx: null,
-    sessionTotalMs: 0,
-    segmentStartedAt: 0,
-    musicMuted: false
-};
-const METRONOME_VOLUME = 0.14;
-const MUSIC_VOLUME = METRONOME_VOLUME / 1.2;
-const MUSIC_TRACKS = [
-    'music/drift-phonk-200108.mp3',
-    'music/fresh-457883.mp3',
-    'music/she-hates-my-reps-464309.mp3',
-    'music/summer-trip-audio-oficial-243190.mp3',
-    'music/trap-future-bass-royalty-free-music-167020.mp3'
-];
-let musicPlayer = null;
-let lastMusicIndex = null;
-let historyEntries = [];
-let pendingConfirmAction = null;
-let latestCompletionEntry = null;
-function byId(id) {
-    const el = document.getElementById(id);
-    if (!el)
-        throw new Error(`Element not found: ${id}`);
-    return el;
+    catch {
+        return `browser-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+    }
 }
-function byScreen(screen) {
+const voiceCoach = new VoiceCoach();
+const state = {
+    screen: 'auth',
+    authMode: 'signup',
+    activeUser: null,
+    sessions: [],
+    fmsSessions: [],
+    latestSession: null,
+    bootstrapping: true,
+    live: {
+        engine: null,
+        pose: null,
+        stream: null,
+        rafId: null,
+        sending: false,
+        paused: false,
+        pausedAtMs: null,
+        startedAtMs: 0,
+        pausedDurationMs: 0,
+        snapshot: null,
+        completionHandled: false
+    },
+    fms: {
+        draft: null,
+        currentTaskIndex: 0,
+        latestSession: null,
+        camera: {
+            taskId: null,
+            analyzer: null,
+            landmarker: null,
+            stream: null,
+            rafId: null,
+            loading: false,
+            error: null,
+            review: null,
+            assessment: null,
+            mode: 'primary',
+            lastVideoTime: -1,
+            running: false
+        }
+    },
+    analytics: {
+        currentVisit: null,
+        browserSessionId: loadBrowserSessionId()
+    }
+};
+function byId(id) {
+    const element = document.getElementById(id);
+    if (!element)
+        throw new Error(`Missing element: ${id}`);
+    return element;
+}
+function queryScreen(screen) {
     const panel = document.querySelector(`[data-screen="${screen}"]`);
     if (!panel)
-        throw new Error(`Screen not found: ${screen}`);
+        throw new Error(`Missing screen: ${screen}`);
     return panel;
 }
 const els = {
     screens: Array.from(document.querySelectorAll('[data-screen]')),
-    selectScreen: byScreen('select'),
-    detailsScreen: byScreen('details'),
-    exerciseScreen: byScreen('exercise'),
-    historyScreen: byScreen('history'),
-    trainingList: byId('training-list'),
-    selectTrainings: byId('select-trainings-btn'),
-    selectProfile: byId('select-profile-btn'),
-    historyTrainings: byId('history-trainings-btn'),
-    historyProfile: byId('history-profile-btn'),
-    detailTrainingName: byId('detail-training-name'),
-    detailTrainingDesc: byId('detail-training-desc'),
-    totalTime: byId('total-time'),
-    detailExerciseList: byId('detail-exercise-list'),
-    detailBack: byId('detail-back-btn'),
-    detailStart: byId('detail-start-btn'),
-    exerciseDetailTitle: byId('exercise-detail-title'),
-    exerciseDetailMeta: byId('exercise-detail-meta'),
-    exerciseDetailTips: byId('exercise-detail-tips'),
-    exerciseBack: byId('exercise-back-btn'),
-    exerciseVideo: byId('exercise-video'),
-    exerciseVideoPlaceholder: byId('exercise-video-placeholder'),
-    playerTrainingName: byId('player-training-name'),
-    start: byId('start-btn'),
-    pause: byId('pause-btn'),
-    statusChip: byId('status-chip'),
-    musicToggle: byId('music-toggle-btn'),
-    playerVideo: byId('player-video'),
-    playerVideoPlaceholder: byId('player-video-placeholder'),
-    currentTitle: byId('current-title'),
-    currentDetail: byId('current-detail'),
-    currentRemaining: byId('current-remaining'),
-    phasePill: byId('phase-pill'),
-    segmentProgressWrap: byId('segment-progress'),
-    segmentProgressBar: byId('segment-progress-bar'),
-    phaseBlocks: byId('phase-blocks'),
-    progressBar: byId('progress-bar'),
-    sessionRemaining: byId('session-remaining'),
-    playerPlaceholder: byId('player-placeholder'),
-    playerMain: byId('player-main'),
-    completeXpEarned: byId('complete-xp-earned'),
-    completeTrainingTime: byId('complete-training-time'),
-    completeStreak: byId('complete-streak'),
-    completeTotalXp: byId('complete-total-xp'),
-    completeTrainingName: byId('complete-training-name'),
-    completeShare: byId('complete-share-btn'),
-    completeShareTargets: byId('complete-share-targets'),
-    completeShareInstagram: byId('complete-share-instagram-btn'),
-    completeShareX: byId('complete-share-x-btn'),
-    completeToSelection: byId('complete-to-selection'),
-    completeToHistory: byId('complete-to-history'),
+    authForm: byId('auth-form'),
+    authModeLabel: byId('auth-mode-label'),
+    authTitle: byId('auth-title'),
+    authHelper: byId('auth-helper'),
+    authNameRow: byId('auth-name-row'),
+    authSexRow: byId('auth-sex-row'),
+    authNameInput: byId('auth-name-input'),
+    authSexSelect: byId('auth-sex-select'),
+    authEmailInput: byId('auth-email-input'),
+    authPasswordInput: byId('auth-password-input'),
+    authSubmitBtn: byId('auth-submit-btn'),
+    authSwitchCopy: byId('auth-switch-copy'),
+    authSwitchBtn: byId('auth-switch-btn'),
+    authError: byId('auth-error'),
+    homeGreeting: byId('home-greeting'),
+    homeSessionCopy: byId('home-session-copy'),
+    homeProfileBtn: byId('home-profile-btn'),
+    homeCoachName: byId('home-coach-name'),
+    homeCoachRole: byId('home-coach-role'),
+    homeCoachBio: byId('home-coach-bio'),
+    homeTotalSessions: byId('home-total-sessions'),
+    coachCard: byId('coach-card'),
+    homeNavHome: byId('home-nav-home'),
+    homeNavFms: byId('home-nav-fms'),
+    homeNavProfile: byId('home-nav-profile'),
+    fmsHomeBtn: byId('fms-home-btn'),
+    fmsProfileBtn: byId('fms-profile-btn'),
+    fmsRoot: byId('fms-root'),
+    fmsNavHome: byId('fms-nav-home'),
+    fmsNavFms: byId('fms-nav-fms'),
+    fmsNavProfile: byId('fms-nav-profile'),
+    detailsBackBtn: byId('details-back-btn'),
+    detailsCoachName: byId('details-coach-name'),
+    detailsCoachRole: byId('details-coach-role'),
+    detailsTitle: byId('details-title'),
+    detailsSubtitle: byId('details-subtitle'),
+    detailsSets: byId('details-sets'),
+    detailsReps: byId('details-reps'),
+    detailsRest: byId('details-rest'),
+    detailsFocusList: byId('details-focus-list'),
+    detailsTips: byId('details-tips'),
+    detailsStartBtn: byId('details-start-btn'),
+    cameraVideo: byId('camera-video'),
+    cameraCanvas: byId('camera-canvas'),
+    orientationChip: byId('orientation-chip'),
+    cameraError: byId('camera-error'),
+    liveSetValue: byId('live-set-value'),
+    liveRepValue: byId('live-rep-value'),
+    restPill: byId('rest-pill'),
+    pauseToggleBtn: byId('pause-toggle-btn'),
+    quitBtn: byId('quit-btn'),
+    resultsName: byId('results-name'),
+    resultsTotalReps: byId('results-total-reps'),
+    resultsValidReps: byId('results-valid-reps'),
+    resultsDepthScore: byId('results-depth-score'),
+    resultsPostureScore: byId('results-posture-score'),
+    resultsNotes: byId('results-notes'),
+    resultsHomeBtn: byId('results-home-btn'),
+    resultsProfileBtn: byId('results-profile-btn'),
+    profileHomeBtn: byId('profile-home-btn'),
+    logoutBtn: byId('logout-btn'),
+    profileName: byId('profile-name'),
+    profileEmail: byId('profile-email'),
+    profileTotalSessions: byId('profile-total-sessions'),
+    profileTotalValidReps: byId('profile-total-valid-reps'),
+    profileDepthScore: byId('profile-depth-score'),
+    profilePostureScore: byId('profile-posture-score'),
     historyList: byId('history-list'),
-    historyTotalXp: byId('history-total-xp'),
-    historyStreak: byId('history-streak'),
-    metronomeBack: byId('metronome-back-btn'),
-    confirmOverlay: byId('confirm-overlay'),
-    confirmMessage: byId('confirm-message'),
-    confirmNo: byId('confirm-no-btn'),
-    confirmYes: byId('confirm-yes-btn')
+    profileNavHome: byId('profile-nav-home'),
+    profileNavFms: byId('profile-nav-fms'),
+    profileNavProfile: byId('profile-nav-profile')
 };
-const phaseMeta = {
-    go: { label: 'Vai', tone: 880 },
-    pause: { label: 'Pausa', tone: 720 },
-    return: { label: 'Volta', tone: 900 },
-    rest: { label: 'Descanso', tone: 520 },
-    hold: { label: 'Segura', tone: 760 },
-    setRest: { label: 'Descanso', tone: 460 },
-    prep: { label: 'Prepare-se', tone: 0 }
-};
-const routineColors = {
-    'Push-Up': getComputedStyle(document.documentElement).getPropertyValue('--push') || '#f4a261',
-    'Pull-Up': getComputedStyle(document.documentElement).getPropertyValue('--pull') || '#3fa9f5',
-    Squat: getComputedStyle(document.documentElement).getPropertyValue('--squat') || '#7ddf89',
-    Core: getComputedStyle(document.documentElement).getPropertyValue('--core') || '#e9c46a',
-    Cardio: getComputedStyle(document.documentElement).getPropertyValue('--cardio') || '#f3722c',
-    Mobility: getComputedStyle(document.documentElement).getPropertyValue('--mobility') || '#8ecae6'
-};
-const routineLabels = {
-    'Push-Up': 'Empurrar',
-    'Pull-Up': 'Puxar',
-    Squat: 'Agachamento',
-    Core: 'Abdômen',
-    Cardio: 'Cardio',
-    Mobility: 'Mobilidade'
-};
-function hasTempo(exercise) {
-    return 'tempo' in exercise;
+function formatPercent(value) {
+    return `${Math.round(value)}%`;
 }
-function hasTime(exercise) {
-    return 'time' in exercise;
+function formatDuration(seconds) {
+    const mins = Math.floor(seconds / 60);
+    const secs = seconds % 60;
+    return `${mins}:${`${secs}`.padStart(2, '0')}`;
 }
-function formatRoutineLabel(routine) {
-    return routineLabels[routine] ?? routine;
+function formatDate(value) {
+    return new Intl.DateTimeFormat('en-US', {
+        month: 'short',
+        day: 'numeric',
+        hour: 'numeric',
+        minute: '2-digit'
+    }).format(new Date(value));
 }
-function createTestExercise(exercise, group) {
-    const rest = 2;
-    if (hasTempo(exercise)) {
-        return {
-            ...exercise,
-            group,
-            sets: 1,
-            reps: 2,
-            rest,
-            baseRest: rest,
-            restMultiplier: 1,
-            tempo: {
-                go: 1,
-                pause: 0,
-                return: 1,
-                rest: 0
-            }
-        };
-    }
-    if (hasTime(exercise)) {
-        return {
-            ...exercise,
-            group,
-            sets: 1,
-            time: 5,
-            rest,
-            baseRest: rest,
-            restMultiplier: 1
-        };
-    }
-    const _exhaustive = exercise;
-    throw new Error(`Unsupported exercise type: ${String(_exhaustive)}`);
+function escapeHtml(value) {
+    return value
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;')
+        .replaceAll('"', '&quot;')
+        .replaceAll("'", '&#39;');
 }
-const intensiveProgram = trainingPrograms.intensive;
-if (intensiveProgram.kind !== 'intensive') {
-    throw new Error('Programa intensivo inválido.');
+function formatFmsStatus(status) {
+    if (status === 'completed')
+        return 'Completed';
+    if (status === 'stopped_pain')
+        return 'Stopped for pain';
+    if (status === 'incomplete')
+        return 'Incomplete';
+    return 'In progress';
 }
-const TEST_TRAINING_GROUPS = intensiveProgram.groups.map(group => ({
-    group: group.group,
-    restMultiplier: group.restMultiplier,
-    exercises: group.exercises.slice(0, 1).map(exercise => createTestExercise(exercise, group.group))
-}));
-init();
-function init() {
-    historyEntries = loadHistory();
-    els.trainingList.addEventListener('click', event => {
-        const target = event.target.closest('[data-training-id]');
-        const trainingId = target?.dataset.trainingId;
-        if (!trainingId)
-            return;
-        selectTraining(trainingId);
-        showScreen('details');
-    });
-    els.selectTrainings.addEventListener('click', () => {
-        openTrainingRoutineScreen();
-    });
-    els.selectProfile.addEventListener('click', () => {
-        openProfileScreen();
-    });
-    els.historyTrainings.addEventListener('click', () => {
-        openTrainingRoutineScreen();
-    });
-    els.historyProfile.addEventListener('click', () => {
-        openProfileScreen();
-    });
-    els.detailExerciseList.addEventListener('click', event => {
-        const target = event.target.closest('[data-exercise-name]');
-        const exerciseName = target?.dataset.exerciseName;
-        if (!exerciseName)
-            return;
-        showExerciseDetails(exerciseName);
-    });
-    els.detailBack.addEventListener('click', () => {
-        showScreen('select');
-    });
-    els.detailStart.addEventListener('click', () => {
-        showScreen('metronome');
-        startSession();
-    });
-    els.exerciseBack.addEventListener('click', () => {
-        showScreen('details');
-    });
-    els.metronomeBack.addEventListener('click', () => {
-        if (state.status === 'running' || state.status === 'paused') {
-            openTrainingConfirm('leave');
-            return;
-        }
-        resetSession();
-        showScreen('details');
-    });
-    els.completeToSelection.addEventListener('click', () => {
-        resetSession();
-        openTrainingRoutineScreen();
-    });
-    els.completeToHistory.addEventListener('click', () => {
-        openProfileScreen();
-    });
-    els.start.addEventListener('click', () => {
-        if (state.status === 'running' || state.status === 'paused') {
-            openTrainingConfirm('reset');
-            return;
-        }
-        startSession();
-    });
-    els.pause.addEventListener('click', () => {
-        if (state.status === 'running') {
-            pauseSession();
-        }
-        else if (state.status === 'paused') {
-            resumeSession();
-        }
-    });
-    els.musicToggle.addEventListener('click', () => {
-        setMusicMuted(!state.musicMuted);
-    });
-    els.completeShare.addEventListener('click', () => {
-        els.completeShareTargets.hidden = !els.completeShareTargets.hidden;
-    });
-    els.completeShareInstagram.addEventListener('click', () => {
-        void shareCompletion('instagram');
-    });
-    els.completeShareX.addEventListener('click', () => {
-        void shareCompletion('x');
-    });
-    els.confirmNo.addEventListener('click', () => {
-        closeTrainingConfirm();
-    });
-    els.confirmYes.addEventListener('click', () => {
-        handleTrainingConfirm();
-    });
-    bindSwipeNavigation(els.selectScreen, {
-        left: () => openProfileScreen()
-    });
-    bindSwipeNavigation(els.historyScreen, {
-        right: () => openTrainingRoutineScreen()
-    });
-    bindSwipeNavigation(els.detailsScreen, {
-        left: () => openTrainingRoutineScreen()
-    });
-    bindSwipeNavigation(els.exerciseScreen, {
-        left: () => showScreen('details')
-    });
-    if (TRAININGS.length) {
-        selectTraining(TRAININGS[0].id);
-    }
-    renderHistory();
-    updateMusicToggle();
-    showScreen('select');
+function sexForFms(user) {
+    return user?.sexForTSPU ?? 'unspecified';
 }
-function showScreen(screen) {
-    els.screens.forEach(panel => {
-        panel.hidden = panel.dataset.screen !== screen;
-    });
-    if (screen !== 'complete') {
-        els.completeShareTargets.hidden = true;
-    }
-    if (screen !== 'metronome') {
-        closeTrainingConfirm();
-    }
-    setMainNavActive(screen === 'history' ? 'history' : 'select');
-}
-function setButtonStyle(btn, { primary }) {
-    if (!btn)
-        return;
-    btn.classList.toggle('primary', primary);
-    btn.classList.toggle('ghost', !primary);
-}
-function openProfileScreen() {
-    renderHistory();
-    showScreen('history');
-}
-function openTrainingRoutineScreen() {
-    showScreen('select');
-}
-function setMainNavActive(activeScreen) {
-    const selectingTrainings = activeScreen === 'select';
-    els.selectTrainings.classList.toggle('is-active', selectingTrainings);
-    els.selectProfile.classList.toggle('is-active', !selectingTrainings);
-    els.historyTrainings.classList.toggle('is-active', selectingTrainings);
-    els.historyProfile.classList.toggle('is-active', !selectingTrainings);
-}
-function bindSwipeNavigation(element, handlers) {
-    let startX = 0;
-    let startY = 0;
-    let isTracking = false;
-    element.addEventListener('touchstart', event => {
-        if (event.touches.length !== 1)
-            return;
-        const touch = event.touches[0];
-        startX = touch.clientX;
-        startY = touch.clientY;
-        isTracking = true;
-    }, { passive: true });
-    element.addEventListener('touchcancel', () => {
-        isTracking = false;
-    });
-    element.addEventListener('touchend', event => {
-        if (!isTracking)
-            return;
-        isTracking = false;
-        const touch = event.changedTouches[0];
-        if (!touch)
-            return;
-        const deltaX = touch.clientX - startX;
-        const deltaY = touch.clientY - startY;
-        if (Math.abs(deltaX) < SWIPE_THRESHOLD_PX)
-            return;
-        if (Math.abs(deltaX) < Math.abs(deltaY) * SWIPE_DOMINANCE_RATIO)
-            return;
-        if (deltaX < 0) {
-            handlers.left?.();
-        }
-        else {
-            handlers.right?.();
-        }
-    }, { passive: true });
-}
-function getSelectedTraining() {
-    const training = TRAININGS.find(item => item.id === state.selectedTrainingId) ?? TRAININGS[0];
-    if (!training)
-        throw new Error('No trainings configured');
-    return training;
-}
-function selectTraining(id) {
-    state.selectedTrainingId = id;
-    const training = getSelectedTraining();
-    state.programKey = training.programKey;
-    renderTrainingList();
-    renderTrainingDetail();
-    resetSession();
-}
-function renderTrainingList() {
-    const cards = TRAININGS.map(training => {
-        const summary = computeProgramSummary(training.programKey);
-        const active = training.id === state.selectedTrainingId ? 'active' : '';
-        return `
-      <button class="training-card ${active}" type="button" data-training-id="${training.id}">
-        <div>
-          <h3>${training.name}</h3>
-          <p class="muted small">equipamento: ${training.equipment}</p>
-        </div>
-        <div class="training-stat">
-          <span class="label">Duração</span>
-          <span class="value">${formatSeconds(summary.totalSeconds)}</span>
-        </div>
-      </button>
-    `;
-    });
-    els.trainingList.innerHTML = cards.join('');
-}
-function renderTrainingDetail() {
-    const training = getSelectedTraining();
-    const summary = updateDetailStats(training);
-    els.detailTrainingName.textContent = training.name;
-    els.detailTrainingDesc.textContent = training.equipment;
-    els.detailTrainingDesc.hidden = training.equipment.trim().length === 0;
-    els.playerTrainingName.textContent = training.name;
-    els.sessionRemaining.textContent = formatSeconds(summary.totalSeconds);
-    updateVideoBlocks(training);
-    renderExerciseList();
-}
-function updateVideoBlocks(training) {
-    const video = training.video;
-    updateVideoBlock(els.exerciseVideo, els.exerciseVideoPlaceholder, video);
-    updateVideoBlock(els.playerVideo, els.playerVideoPlaceholder, video);
-}
-function updateVideoBlock(videoEl, placeholderEl, video) {
-    if (!video) {
-        videoEl.pause();
-        videoEl.removeAttribute('src');
-        videoEl.classList.remove('is-portrait');
-        videoEl.hidden = true;
-        placeholderEl.hidden = false;
-        videoEl.load();
-        return;
-    }
-    videoEl.hidden = false;
-    placeholderEl.hidden = true;
-    videoEl.classList.toggle('is-portrait', video.orientation === 'portrait');
-    if (videoEl.getAttribute('src') !== video.src) {
-        videoEl.pause();
-        videoEl.setAttribute('src', video.src);
-        videoEl.load();
-    }
-}
-function updateDetailStats(training) {
-    const summary = computeProgramSummary(training.programKey);
-    els.totalTime.textContent = formatSeconds(summary.totalSeconds);
-    return summary;
-}
-function renderExerciseList() {
-    const exercises = getProgramExercises(state.programKey);
-    const schedule = buildSchedule(state.programKey);
-    const perExerciseSeconds = schedule.reduce((acc, seg) => {
-        acc[seg.exerciseName] = (acc[seg.exerciseName] || 0) + seg.duration;
-        return acc;
-    }, {});
-    const cards = exercises.map(ex => {
-        const totalSeconds = perExerciseSeconds[ex.name] || 0;
-        const color = routineColors[ex.routine] || 'var(--stroke)';
-        const tempo = hasTempo(ex)
-            ? `Tempo ${ex.tempo.go}-${ex.tempo.pause}-${ex.tempo.return}-${ex.tempo.rest}`
-            : null;
-        const setsCount = ex.sets ?? 0;
-        const volume = hasTempo(ex)
-            ? `${setsCount} x ${ex.reps} repetições`
-            : hasTime(ex)
-                ? `${setsCount} x ${ex.time}s`
-                : `${setsCount} séries`;
-        const restLabel = ex.rest > 0 ? `Pausa: ${formatSeconds(ex.rest || 0)}` : '';
-        return `
-      <button class="exercise-card" type="button" data-exercise-card="${ex.name}" data-exercise-name="${ex.name}" style="--card-accent:${color}">
-        <div class="meta">
-          <span class="badge">${formatRoutineLabel(ex.routine)}</span>
-          <span class="time">~${formatSeconds(totalSeconds)}</span>
-        </div>
-        <div class="name">${ex.name}</div>
-        <div class="tempo">${volume}${tempo ? ` · ${tempo}` : ''}</div>
-        ${restLabel ? `<div class="tempo">${restLabel}</div>` : ''}
-        ${ex.group
-            ? `<div class="badge">Grupo ${ex.group} · Descanso x${Number(ex.restMultiplier || 1).toFixed(2)}</div>`
-            : ''}
-      </button>
-    `;
-    });
-    els.detailExerciseList.innerHTML = cards.join('');
-}
-function showExerciseDetails(exerciseName) {
-    const exercise = getProgramExercises(state.programKey).find(ex => ex.name === exerciseName);
-    if (!exercise)
-        return;
-    updateVideoBlocks(getSelectedTraining());
-    els.exerciseDetailTitle.textContent = exercise.name;
-    els.exerciseDetailMeta.textContent = formatExerciseMeta(exercise);
-    const tips = exercise.tips?.length ? exercise.tips.map(tip => `• ${tip}`).join('\n') : NO_TIPS_MESSAGE;
-    els.exerciseDetailTips.textContent = tips;
-    showScreen('exercise');
-}
-function formatExerciseMeta(exercise) {
-    const base = `${formatRoutineLabel(exercise.routine)} · ${exercise.sets} séries`;
-    if (hasTempo(exercise)) {
-        const tempo = `${exercise.tempo.go}-${exercise.tempo.pause}-${exercise.tempo.return}-${exercise.tempo.rest}`;
-        return `${base} · ${exercise.reps} repetições · Tempo ${tempo}`;
-    }
-    if (hasTime(exercise)) {
-        return `${base} · ${exercise.time}s`;
-    }
-    return base;
-}
-function loadHistory() {
-    if (!('localStorage' in window))
-        return [];
-    const raw = window.localStorage.getItem(HISTORY_STORAGE_KEY);
-    if (!raw)
-        return [];
-    try {
-        const parsed = JSON.parse(raw);
-        if (!Array.isArray(parsed))
-            return [];
-        return parsed.filter(isHistoryEntry);
-    }
-    catch {
-        return [];
-    }
-}
-function isHistoryEntry(value) {
-    if (!value || typeof value !== 'object')
-        return false;
-    const entry = value;
-    return (typeof entry.id === 'string' &&
-        typeof entry.trainingId === 'string' &&
-        typeof entry.trainingName === 'string' &&
-        typeof entry.completedAt === 'string' &&
-        typeof entry.durationSeconds === 'number' &&
-        typeof entry.xpEarned === 'number');
-}
-function saveHistory(entries) {
-    if (!('localStorage' in window))
-        return;
-    window.localStorage.setItem(HISTORY_STORAGE_KEY, JSON.stringify(entries));
-}
-function getTotalXp(entries) {
-    return entries.reduce((sum, entry) => sum + entry.xpEarned, 0);
-}
-function formatStreak(streak) {
-    return `${streak} ${streak === 1 ? 'dia' : 'dias'}`;
-}
-function getDateKey(date) {
-    const year = date.getFullYear();
-    const month = String(date.getMonth() + 1).padStart(2, '0');
-    const day = String(date.getDate()).padStart(2, '0');
-    return `${year}-${month}-${day}`;
-}
-function getCurrentStreak(entries) {
-    if (!entries.length)
+function buildFmsPatternFinalScore(patternKey, pattern) {
+    if (pattern.pain || pattern.clearingPain)
         return 0;
-    const completedDays = new Set();
-    entries.forEach(entry => {
-        const date = new Date(entry.completedAt);
-        if (!Number.isNaN(date.getTime())) {
-            completedDays.add(getDateKey(date));
-        }
-    });
-    const cursor = new Date();
-    cursor.setHours(0, 0, 0, 0);
-    let streak = 0;
-    while (completedDays.has(getDateKey(cursor))) {
-        streak += 1;
-        cursor.setDate(cursor.getDate() - 1);
+    if (patternKey === 'deepSquat' || patternKey === 'trunkStabilityPushUp') {
+        return pattern.rawRight;
     }
-    return streak;
+    if (pattern.rawLeft === undefined || pattern.rawRight === undefined) {
+        return undefined;
+    }
+    return Math.min(pattern.rawLeft, pattern.rawRight);
 }
-function recordCompletion() {
-    const training = getSelectedTraining();
-    const durationSeconds = Math.max(0, Math.round(state.sessionTotalMs / 1000));
-    const xpEarned = Math.round(durationSeconds * training.difficulty * XP_RATE);
-    const entry = {
-        id: `session-${Date.now()}`,
-        trainingId: training.id,
-        trainingName: training.name,
-        completedAt: new Date().toISOString(),
-        durationSeconds,
-        xpEarned
+function cloneFmsDraft(draft) {
+    return {
+        ...draft,
+        notes: [...draft.notes],
+        patterns: structuredClone(draft.patterns)
     };
-    historyEntries = [entry, ...historyEntries];
-    saveHistory(historyEntries);
-    return entry;
 }
-function renderCompletion(entry) {
-    latestCompletionEntry = entry;
-    const totalXp = getTotalXp(historyEntries);
-    const streak = getCurrentStreak(historyEntries);
-    els.completeTrainingName.textContent = entry.trainingName;
-    els.completeXpEarned.textContent = `${entry.xpEarned} XP`;
-    els.completeTrainingTime.textContent = formatSeconds(entry.durationSeconds);
-    els.completeStreak.textContent = formatStreak(streak);
-    els.completeTotalXp.textContent = `${totalXp} XP`;
-    els.completeShareTargets.hidden = true;
+function collectFmsSessionNotes(draft) {
+    const outcome = computeFmsOutcome(draft.patterns);
+    const notes = new Set();
+    if (outcome.anyPain) {
+        notes.add('Pain was reported during at least one movement or clearing test.');
+    }
+    if (outcome.anyAsymmetry) {
+        notes.add('Asymmetry was detected between right and left scores in at least one bilateral pattern.');
+    }
+    for (const patternKey of outcome.lowestPatterns) {
+        notes.add(`${getFmsPatternName(patternKey)} was one of the lowest-scoring patterns.`);
+    }
+    for (const patternKey of Object.keys(draft.patterns)) {
+        for (const note of draft.patterns[patternKey].notes) {
+            notes.add(note);
+        }
+    }
+    return Array.from(notes).slice(0, 10);
 }
-function renderHistory() {
-    const totalXp = getTotalXp(historyEntries);
-    const streak = getCurrentStreak(historyEntries);
-    els.historyTotalXp.textContent = `${totalXp} XP`;
-    els.historyStreak.textContent = formatStreak(streak);
-    if (!historyEntries.length) {
-        els.historyList.innerHTML = '<p class="muted small">Nenhum treino concluído ainda.</p>';
+function recalculateFmsDraft(draft) {
+    const next = cloneFmsDraft(draft);
+    for (const patternKey of Object.keys(next.patterns)) {
+        next.patterns[patternKey].finalScore = buildFmsPatternFinalScore(patternKey, next.patterns[patternKey]);
+    }
+    const outcome = computeFmsOutcome(next.patterns);
+    next.anyPain = outcome.anyPain;
+    next.anyAsymmetry = outcome.anyAsymmetry;
+    next.totalScore = outcome.complete ? outcome.totalScore : undefined;
+    next.notes = collectFmsSessionNotes(next);
+    return next;
+}
+function createNewFmsDraft(user, disclaimerAccepted, equipmentConfirmed) {
+    return {
+        startedAt: new Date().toISOString(),
+        status: 'in_progress',
+        disclaimerAccepted,
+        sexForTSPU: user.sexForTSPU,
+        equipmentConfirmed,
+        patterns: createEmptyFmsPatterns(),
+        totalScore: undefined,
+        anyPain: false,
+        anyAsymmetry: false,
+        notes: []
+    };
+}
+async function refreshUserData() {
+    state.activeUser = await getActiveUser();
+    state.sessions = state.activeUser ? await getSessionsForUser() : [];
+    state.fmsSessions = state.activeUser ? await getFmsSessionsForUser() : [];
+    state.fms.latestSession = state.fmsSessions[0] ?? null;
+    if (!state.activeUser) {
+        state.analytics.currentVisit = null;
+    }
+}
+function isTrackedScreen(screen) {
+    return screen !== 'auth';
+}
+function startTrackedScreenVisit(screen) {
+    state.analytics.currentVisit = {
+        screen,
+        enteredAt: new Date().toISOString(),
+        startedAtMs: performance.now()
+    };
+}
+function resumeTrackedScreenVisit() {
+    if (!state.activeUser || !isTrackedScreen(state.screen) || document.visibilityState === 'hidden') {
         return;
     }
-    const items = historyEntries
-        .map(entry => {
-        const date = new Date(entry.completedAt);
-        const dateLabel = date.toLocaleString(undefined, {
-            dateStyle: 'medium',
-            timeStyle: 'short'
-        });
+    if (!state.analytics.currentVisit || state.analytics.currentVisit.screen !== state.screen) {
+        startTrackedScreenVisit(state.screen);
+    }
+}
+async function flushTrackedScreenVisit(useBeacon = false) {
+    const currentVisit = state.analytics.currentVisit;
+    if (!currentVisit || !state.activeUser) {
+        state.analytics.currentVisit = null;
+        return;
+    }
+    state.analytics.currentVisit = null;
+    const payload = {
+        pageName: currentVisit.screen,
+        enteredAt: currentVisit.enteredAt,
+        exitedAt: new Date().toISOString(),
+        durationMs: Math.max(250, Math.round(performance.now() - currentVisit.startedAtMs)),
+        browserSessionId: state.analytics.browserSessionId
+    };
+    try {
+        await recordPageVisit(payload, { useBeacon });
+    }
+    catch (error) {
+        console.error('Could not record page visit', error);
+    }
+}
+function setActiveScreen(screen) {
+    if (screen !== state.screen) {
+        void flushTrackedScreenVisit();
+    }
+    if (state.screen === 'fms' && screen !== 'fms') {
+        void stopFmsCameraResources({ closeLandmarker: true });
+    }
+    state.screen = screen;
+    if (!state.activeUser || !isTrackedScreen(screen)) {
+        state.analytics.currentVisit = null;
+    }
+    else if (!state.analytics.currentVisit || state.analytics.currentVisit.screen !== screen) {
+        startTrackedScreenVisit(screen);
+    }
+    for (const panel of els.screens) {
+        panel.hidden = panel.dataset.screen !== screen;
+    }
+}
+function setText(element, value) {
+    element.textContent = value;
+}
+function showAuthError(message) {
+    els.authError.hidden = message.trim() === '';
+    els.authError.textContent = message;
+}
+function renderAuth() {
+    const isSignup = state.authMode === 'signup';
+    els.authModeLabel.textContent = isSignup ? 'Create account' : 'Log in';
+    els.authTitle.textContent = isSignup ? 'Start your Noskip profile' : 'Welcome back to Noskip';
+    els.authHelper.textContent = isSignup
+        ? 'Create a secure account so your squat sessions and history sync to the backend.'
+        : 'Log in to continue your saved squat history and profile progress.';
+    els.authNameRow.hidden = !isSignup;
+    els.authSexRow.hidden = !isSignup;
+    els.authSubmitBtn.textContent = isSignup ? 'Create account' : 'Log in';
+    els.authSwitchCopy.textContent = isSignup ? 'Already have an account?' : 'Need an account instead?';
+    els.authSwitchBtn.textContent = isSignup ? 'Log in' : 'Create one';
+    if (!state.bootstrapping) {
+        showAuthError('');
+    }
+}
+function renderHome() {
+    const user = state.activeUser;
+    if (!user)
+        return;
+    setText(els.homeGreeting, `${user.name}, your squat coach is ready.`);
+    setText(els.homeSessionCopy, `Today’s protocol is ${squatTraining.session.protocol.sets} sets of ${squatTraining.session.protocol.repsPerSet} reps with ${squatTraining.session.protocol.restSeconds} seconds of rest. Front camera capture is enabled by default on phones.`);
+    setText(els.homeCoachName, squatTraining.coach.name);
+    setText(els.homeCoachRole, squatTraining.coach.role);
+    setText(els.homeCoachBio, squatTraining.coach.bio);
+    setText(els.homeTotalSessions, String(state.sessions.length));
+}
+function renderDetails() {
+    setText(els.detailsCoachName, squatTraining.coach.name);
+    setText(els.detailsCoachRole, squatTraining.coach.role);
+    setText(els.detailsTitle, squatTraining.session.title);
+    setText(els.detailsSubtitle, `${squatTraining.session.subtitle} The live session starts with the phone front camera when available.`);
+    setText(els.detailsSets, String(squatTraining.session.protocol.sets));
+    setText(els.detailsReps, String(squatTraining.session.protocol.repsPerSet));
+    setText(els.detailsRest, `${squatTraining.session.protocol.restSeconds}s`);
+    els.detailsFocusList.innerHTML = '';
+    els.detailsTips.innerHTML = '';
+    for (const item of squatTraining.session.readinessTips) {
+        const li = document.createElement('li');
+        li.textContent = item;
+        els.detailsFocusList.append(li);
+    }
+    for (const item of [
+        'Phone front camera is requested first so you can keep the screen visible during setup.',
+        ...squatTraining.session.techniqueTips
+    ]) {
+        const li = document.createElement('li');
+        li.textContent = item;
+        els.detailsTips.append(li);
+    }
+}
+function renderProfile() {
+    const user = state.activeUser;
+    if (!user)
+        return;
+    const stats = getProfileStats(state.sessions);
+    setText(els.profileName, user.name);
+    setText(els.profileEmail, user.email);
+    setText(els.profileTotalSessions, String(stats.totalSessions));
+    setText(els.profileTotalValidReps, String(stats.totalValidReps));
+    setText(els.profileDepthScore, formatPercent(stats.avgDepthScore));
+    setText(els.profilePostureScore, formatPercent(stats.avgPostureScore));
+    els.historyList.innerHTML = '';
+    if (state.sessions.length === 0) {
+        const empty = document.createElement('p');
+        empty.className = 'history-empty';
+        empty.textContent = 'No sessions saved yet. Finish your first squat session to populate the backend history.';
+        els.historyList.append(empty);
+        return;
+    }
+    for (const session of state.sessions) {
+        const entry = document.createElement('article');
+        entry.className = 'history-entry';
+        const row = document.createElement('div');
+        row.className = 'history-row';
+        row.innerHTML = `
+      <strong>${formatDate(session.completedAt)}</strong>
+      <span class="history-meta">${session.validReps}/${session.totalReps} valid reps</span>
+    `;
+        const scores = document.createElement('div');
+        scores.className = 'history-row history-meta';
+        scores.innerHTML = `
+      <span>Depth ${formatPercent(session.depthScore)}</span>
+      <span>Posture ${formatPercent(session.postureScore)}</span>
+      <span>${formatDuration(session.durationSeconds)}</span>
+    `;
+        entry.append(row, scores);
+        if (session.notes.length > 0) {
+            const note = document.createElement('p');
+            note.className = 'history-note';
+            note.textContent = session.notes.join(' ');
+            entry.append(note);
+        }
+        els.historyList.append(entry);
+    }
+}
+function buildFmsHistoryMarkup() {
+    if (state.fmsSessions.length === 0) {
+        return '<p class="history-empty">No FMS sessions saved yet. Complete the guided screen to build a movement-screen history.</p>';
+    }
+    return state.fmsSessions
+        .slice(0, 5)
+        .map((session) => {
+        const totalScoreMarkup = session.status === 'completed' && typeof session.totalScore === 'number'
+            ? `<span class="history-meta">Total ${session.totalScore} / 21</span>`
+            : `<span class="history-meta">${escapeHtml(formatFmsStatus(session.status))}</span>`;
         return `
-        <div class="history-item">
-          <div class="title">${entry.trainingName}</div>
-          <div class="meta">
-            <span>${dateLabel}</span>
-            <span>${formatSeconds(entry.durationSeconds)} · ${entry.xpEarned} XP</span>
+        <article class="history-entry">
+          <div class="history-row">
+            <strong>${escapeHtml(formatDate(session.startedAt))}</strong>
+            ${totalScoreMarkup}
           </div>
+          <div class="history-row history-meta">
+            <span>${session.anyPain ? 'Pain present' : 'No pain reported'}</span>
+            <span>${session.anyAsymmetry ? 'Asymmetry present' : 'Symmetry preserved'}</span>
+          </div>
+        </article>
+      `;
+    })
+        .join('');
+}
+function buildFmsSummaryMarkup(session) {
+    const patternMarkup = Object.entries(session.patterns)
+        .map(([patternKey, pattern]) => {
+        const scoreLabel = pattern.finalScore === undefined ? 'Pending' : String(pattern.finalScore);
+        const flags = [
+            pattern.pain ? 'Pain' : '',
+            pattern.clearingPain ? 'Clearing pain' : '',
+            pattern.rawLeft !== undefined && pattern.rawRight !== undefined && pattern.rawLeft !== pattern.rawRight
+                ? 'Asymmetry'
+                : ''
+        ]
+            .filter((item) => item !== '')
+            .join(' · ');
+        return `
+        <div class="fms-pattern-row">
+          <span>${escapeHtml(getFmsPatternName(patternKey))}</span>
+          <strong>${escapeHtml(scoreLabel)}</strong>
+          <small>${escapeHtml(flags || 'No flags')}</small>
         </div>
       `;
     })
         .join('');
-    els.historyList.innerHTML = items;
+    const summaryLead = session.status === 'completed' && typeof session.totalScore === 'number'
+        ? `Total score ${session.totalScore} / 21`
+        : formatFmsStatus(session.status);
+    return `
+    <div class="card fms-summary-card">
+      <div class="section-head">
+        <p class="eyebrow">Latest result</p>
+        <h2>${escapeHtml(summaryLead)}</h2>
+        <p class="section-copy">
+          ${session.anyPain ? 'Pain was reported, so this result should not be treated as a diagnosis.' : 'Use the lowest-scoring patterns and any asymmetry as the main review points.'}
+        </p>
+      </div>
+      <div class="fms-pattern-grid">
+        ${patternMarkup}
+      </div>
+    </div>
+  `;
 }
-function cloneExercise(exercise) {
-    if (hasTempo(exercise)) {
-        return {
-            ...exercise,
-            tempo: { ...exercise.tempo }
-        };
+const FMS_TASKS_WASM_ROOT = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.1/wasm';
+const FMS_HEAVY_MODEL_PATH = 'https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_heavy/float16/latest/pose_landmarker_heavy.task';
+function resetFmsCameraViewState() {
+    state.fms.camera.taskId = null;
+    state.fms.camera.analyzer = null;
+    state.fms.camera.loading = false;
+    state.fms.camera.error = null;
+    state.fms.camera.assessment = null;
+    state.fms.camera.lastVideoTime = -1;
+    state.fms.camera.running = false;
+}
+function getFmsCameraElements() {
+    return {
+        video: document.querySelector('#fms-camera-video'),
+        canvas: document.querySelector('#fms-camera-canvas'),
+        status: document.querySelector('#fms-camera-status'),
+        guidance: document.querySelector('#fms-camera-guidance'),
+        error: document.querySelector('#fms-camera-error')
+    };
+}
+function updateFmsCameraFeedback(assessment) {
+    const camera = getFmsCameraElements();
+    if (!camera.status || !camera.guidance || !camera.error)
+        return;
+    if (state.fms.camera.error) {
+        camera.error.hidden = false;
+        camera.error.textContent = state.fms.camera.error;
     }
-    if (hasTime(exercise)) {
-        return { ...exercise };
+    else {
+        camera.error.hidden = true;
+        camera.error.textContent = '';
     }
-    return exercise;
-}
-function getProgramDefinition(key) {
-    if (key === 'test') {
-        return { kind: 'intensive', groups: TEST_TRAINING_GROUPS };
+    if (!assessment) {
+        camera.status.className = 'status-pill camera-status';
+        camera.status.textContent = state.fms.camera.loading ? 'Loading camera' : 'Waiting';
+        camera.guidance.textContent = state.fms.camera.loading
+            ? 'Loading the heavy pose model and opening the camera.'
+            : 'Prepare the camera, then hold still while the app checks your setup.';
+        return;
     }
-    return trainingPrograms[key];
-}
-function getProgramExercises(key) {
-    const program = getProgramDefinition(key);
-    if (program.kind === 'sequence') {
-        const seen = new Set();
-        return program.sequence
-            .filter(ex => {
-            if (seen.has(ex.name))
-                return false;
-            seen.add(ex.name);
-            return true;
-        })
-            .map(ex => cloneExercise(ex));
+    camera.status.className = 'status-pill camera-status';
+    if (assessment.phase === 'ready') {
+        camera.status.classList.add('is-ready');
     }
-    return program.groups.flatMap((group) => group.exercises.map(ex => ({
-        ...cloneExercise(ex),
-        group: group.group
-    })));
+    camera.status.textContent = assessment.statusLabel;
+    camera.guidance.textContent = assessment.guidance;
 }
-function computeProgramSummary(programKey) {
-    const exercises = getProgramExercises(programKey);
-    const schedule = buildSchedule(programKey);
-    const totalSeconds = schedule.reduce((sum, seg) => sum + seg.duration, 0);
-    const totalSets = exercises.reduce((sum, ex) => sum + (ex.sets || 0), 0);
-    const segmentCount = schedule.length;
-    return { totalSeconds, totalSets, segmentCount, exercisesCount: exercises.length };
+function drawFmsPose(landmarks) {
+    const camera = getFmsCameraElements();
+    if (!camera.canvas || !camera.video)
+        return;
+    if (camera.video.videoWidth === 0 || camera.video.videoHeight === 0)
+        return;
+    if (camera.canvas.width !== camera.video.videoWidth || camera.canvas.height !== camera.video.videoHeight) {
+        camera.canvas.width = camera.video.videoWidth;
+        camera.canvas.height = camera.video.videoHeight;
+    }
+    const context = camera.canvas.getContext('2d');
+    if (!context)
+        return;
+    context.clearRect(0, 0, camera.canvas.width, camera.canvas.height);
+    if (!landmarks || landmarks.length === 0)
+        return;
+    context.strokeStyle = '#68e5ff';
+    context.lineWidth = 4;
+    context.lineCap = 'round';
+    context.lineJoin = 'round';
+    for (const [startIndex, endIndex] of FMS_POSE_CONNECTIONS) {
+        const start = landmarks[startIndex];
+        const end = landmarks[endIndex];
+        if (!start || !end)
+            continue;
+        if ((start.visibility ?? 1) < 0.5 || (end.visibility ?? 1) < 0.5)
+            continue;
+        context.beginPath();
+        context.moveTo(start.x * camera.canvas.width, start.y * camera.canvas.height);
+        context.lineTo(end.x * camera.canvas.width, end.y * camera.canvas.height);
+        context.stroke();
+    }
+    context.fillStyle = '#f5f7fb';
+    for (const landmark of landmarks) {
+        if ((landmark.visibility ?? 1) < 0.5)
+            continue;
+        context.beginPath();
+        context.arc(landmark.x * camera.canvas.width, landmark.y * camera.canvas.height, 4, 0, Math.PI * 2);
+        context.fill();
+    }
 }
-function createSetSegments(exercise, setNumber, includeSetRest = true) {
-    const segs = [];
-    if (hasTempo(exercise)) {
-        const phases = [
-            { key: 'go', duration: exercise.tempo.go || 0 },
-            { key: 'pause', duration: exercise.tempo.pause || 0 },
-            { key: 'return', duration: exercise.tempo.return || 0 },
-            { key: 'rest', duration: exercise.tempo.rest || 0 }
-        ];
-        for (let rep = 1; rep <= (exercise.reps || 0); rep++) {
-            phases.forEach(phase => {
-                if (phase.duration <= 0)
-                    return;
-                segs.push({
-                    exerciseName: exercise.name,
-                    routine: exercise.routine,
-                    set: setNumber,
-                    totalSets: exercise.sets,
-                    rep,
-                    totalReps: exercise.reps,
-                    phase: phase.key,
-                    type: phase.key === 'rest' ? 'micro-rest' : 'movement',
-                    duration: phase.duration,
-                    group: exercise.group || null,
-                    tempoParts: {
-                        go: exercise.tempo.go || 0,
-                        pause: exercise.tempo.pause || 0,
-                        return: exercise.tempo.return || 0,
-                        rest: exercise.tempo.rest || 0
-                    }
+async function stopFmsCameraResources(options = {}) {
+    if (state.fms.camera.rafId !== null) {
+        cancelAnimationFrame(state.fms.camera.rafId);
+        state.fms.camera.rafId = null;
+    }
+    if (state.fms.camera.stream) {
+        for (const track of state.fms.camera.stream.getTracks()) {
+            track.stop();
+        }
+        state.fms.camera.stream = null;
+    }
+    if (options.closeLandmarker && state.fms.camera.landmarker) {
+        state.fms.camera.landmarker.close();
+        state.fms.camera.landmarker = null;
+    }
+    const camera = getFmsCameraElements();
+    if (camera.video) {
+        camera.video.srcObject = null;
+    }
+    if (camera.canvas) {
+        camera.canvas.getContext('2d')?.clearRect(0, 0, camera.canvas.width, camera.canvas.height);
+    }
+    if (!options.preserveReview) {
+        state.fms.camera.review = null;
+    }
+    resetFmsCameraViewState();
+    updateFmsCameraFeedback(state.fms.camera.assessment);
+}
+async function getMediaPipeVisionModule() {
+    if (!window.__mediaPipeVisionModulePromise) {
+        window.__mediaPipeVisionModulePromise = import('https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.1/vision_bundle.mjs');
+    }
+    return window.__mediaPipeVisionModulePromise;
+}
+async function ensureFmsLandmarker() {
+    if (state.fms.camera.landmarker) {
+        return state.fms.camera.landmarker;
+    }
+    const vision = await getMediaPipeVisionModule();
+    const fileset = await vision.FilesetResolver.forVisionTasks(FMS_TASKS_WASM_ROOT);
+    state.fms.camera.landmarker = await vision.PoseLandmarker.createFromOptions(fileset, {
+        baseOptions: {
+            modelAssetPath: FMS_HEAVY_MODEL_PATH
+        },
+        runningMode: 'VIDEO',
+        numPoses: 1,
+        minPoseDetectionConfidence: 0.5,
+        minPosePresenceConfidence: 0.5,
+        minTrackingConfidence: 0.5,
+        outputSegmentationMasks: false
+    });
+    return state.fms.camera.landmarker;
+}
+function renderFmsCaptureMetrics(metrics) {
+    if (metrics.length === 0)
+        return '';
+    return `
+    <div class="fms-metric-grid">
+      ${metrics.map((metric) => `<div class="results-note">${escapeHtml(metric)}</div>`).join('')}
+    </div>
+  `;
+}
+function reviewActionMarkup(task, review) {
+    const actions = ['<button class="secondary-button" data-fms-action="retry-capture" type="button">Retry capture</button>'];
+    if (task.patternKey === 'deepSquat' && review.score < 3 && review.mode === 'primary') {
+        actions.push('<button class="secondary-button" data-fms-action="retry-heels" type="button">Retry with heels elevated</button>');
+    }
+    if (task.patternKey === 'rotaryStability' && review.score < 3 && review.mode === 'primary') {
+        actions.push('<button class="secondary-button" data-fms-action="retry-diagonal" type="button">Try diagonal regression</button>');
+    }
+    return actions.join('');
+}
+async function startFmsMovementCapture(task, mode = state.fms.camera.mode) {
+    const draft = state.fms.draft;
+    if (!draft)
+        return;
+    if (state.fms.camera.running && state.fms.camera.taskId === task.id && state.fms.camera.mode === mode) {
+        return;
+    }
+    await stopFmsCameraResources({ preserveReview: false });
+    state.fms.camera.mode = mode;
+    state.fms.camera.taskId = task.id;
+    state.fms.camera.loading = true;
+    state.fms.camera.error = null;
+    state.fms.camera.review = null;
+    state.fms.camera.assessment = null;
+    updateFmsCameraFeedback(null);
+    try {
+        const stream = await navigator.mediaDevices.getUserMedia({
+            audio: false,
+            video: {
+                facingMode: 'user',
+                width: { ideal: 1280 },
+                height: { ideal: 720 }
+            }
+        });
+        const landmarker = await ensureFmsLandmarker();
+        const camera = getFmsCameraElements();
+        if (!camera.video) {
+            throw new Error('The FMS camera view is missing from the screen.');
+        }
+        state.fms.camera.stream = stream;
+        state.fms.camera.analyzer = new FmsTaskAnalyzer(task, draft.sexForTSPU, mode);
+        state.fms.camera.lastVideoTime = -1;
+        state.fms.camera.running = true;
+        state.fms.camera.loading = false;
+        camera.video.srcObject = stream;
+        await camera.video.play();
+        updateFmsCameraFeedback(null);
+        const tick = () => {
+            if (!state.fms.camera.running || !state.fms.camera.analyzer)
+                return;
+            state.fms.camera.rafId = requestAnimationFrame(tick);
+            const currentCamera = getFmsCameraElements();
+            if (!currentCamera.video || currentCamera.video.readyState < 2)
+                return;
+            if (currentCamera.video.currentTime === state.fms.camera.lastVideoTime)
+                return;
+            state.fms.camera.lastVideoTime = currentCamera.video.currentTime;
+            const result = landmarker.detectForVideo(currentCamera.video, performance.now());
+            const landmarks = result.landmarks[0] ?? [];
+            const worldLandmarks = result.worldLandmarks[0] ?? [];
+            const assessment = state.fms.camera.analyzer.processFrame({ landmarks, worldLandmarks }, performance.now());
+            state.fms.camera.assessment = assessment;
+            updateFmsCameraFeedback(assessment);
+            drawFmsPose(assessment.landmarks);
+            if (assessment.phase === 'ready' && !state.fms.camera.analyzer.hasAnnouncedReady) {
+                state.fms.camera.analyzer.markReadyAnnounced();
+                voiceCoach.speak({
+                    key: `fms-ready-${task.id}-${mode}`,
+                    message: 'Perform the movement now.',
+                    minIntervalMs: 0
                 });
-            });
-        }
-    }
-    else if (hasTime(exercise) && exercise.time) {
-        segs.push({
-            exerciseName: exercise.name,
-            routine: exercise.routine,
-            set: setNumber,
-            totalSets: exercise.sets,
-            rep: null,
-            totalReps: null,
-            phase: 'hold',
-            type: 'hold',
-            duration: exercise.time,
-            group: exercise.group || null,
-            tempoParts: {
-                hold: exercise.time || 0
             }
-        });
-    }
-    if (includeSetRest && setNumber < (exercise.sets || 0) && exercise.rest > 0) {
-        const restBetweenSets = typeof exercise.rest === 'number' ? exercise.rest : 0;
-        segs.push({
-            exerciseName: exercise.name,
-            routine: exercise.routine,
-            set: setNumber,
-            totalSets: exercise.sets,
-            rep: null,
-            totalReps: null,
-            phase: 'setRest',
-            type: 'rest',
-            duration: restBetweenSets,
-            group: exercise.group || null,
-            tempoParts: {
-                setRest: restBetweenSets
+            if (assessment.phase === 'captured' && assessment.capture) {
+                state.fms.camera.review = assessment.capture;
+                voiceCoach.speak({
+                    key: `fms-captured-${task.id}-${mode}`,
+                    message: 'Movement captured.',
+                    interrupt: true,
+                    minIntervalMs: 0
+                });
+                void stopFmsCameraResources({ preserveReview: true });
+                renderApp();
             }
+        };
+        voiceCoach.speak({
+            key: `fms-task-${task.id}-${mode}`,
+            message: task.voiceScript,
+            interrupt: true,
+            minIntervalMs: 0
         });
+        tick();
     }
-    return segs;
+    catch (error) {
+        state.fms.camera.loading = false;
+        state.fms.camera.error = error instanceof Error ? error.message : 'Could not start the heavy pose model.';
+        state.fms.camera.running = false;
+        updateFmsCameraFeedback(null);
+    }
 }
-function createPrepSegment() {
-    return {
-        exerciseName: 'Prepare-se',
-        routine: 'Cardio',
-        set: 0,
-        totalSets: 0,
-        rep: null,
-        totalReps: null,
-        phase: 'prep',
-        type: 'rest',
-        duration: PREP_DELAY_SECONDS,
-        group: null,
-        tempoParts: {
-            hold: PREP_DELAY_SECONDS
+function renderFms() {
+    const user = state.activeUser;
+    if (!user)
+        return;
+    const latestFmsSession = state.fms.latestSession ?? state.fmsSessions[0] ?? null;
+    const draft = state.fms.draft;
+    const currentSex = draft?.sexForTSPU ?? sexForFms(user);
+    const tasks = createFmsTasks(currentSex);
+    const task = draft ? tasks[state.fms.currentTaskIndex] : null;
+    const progressLabel = task ? `Step ${state.fms.currentTaskIndex + 1} of ${tasks.length}` : 'Before you start';
+    const latestSummaryMarkup = latestFmsSession ? buildFmsSummaryMarkup(latestFmsSession) : '';
+    if (!draft) {
+        void stopFmsCameraResources({ closeLandmarker: true });
+        const sexPromptMarkup = currentSex === 'unspecified'
+            ? `
+            <div class="card fms-card">
+              <div class="section-head">
+                <p class="eyebrow">Profile requirement</p>
+                <h2>Save the sex used for the push-up rule</h2>
+                <p class="section-copy">
+                  The Trunk Stability Push-Up uses different official hand positions for male and female standards. This is saved to the profile for scoring, but it is not shown on the visible profile screen.
+                </p>
+              </div>
+              <label class="field">
+                <span>Sex used for the FMS standard</span>
+                <select id="fms-sex-select">
+                  <option value="">Select one</option>
+                  <option value="male">Male</option>
+                  <option value="female">Female</option>
+                </select>
+              </label>
+              <div class="action-bar">
+                <button class="primary-button" data-fms-action="save-sex" type="button">Save to profile</button>
+              </div>
+            </div>
+          `
+            : '';
+        els.fmsRoot.innerHTML = `
+      <div class="card splash-card">
+        <p class="eyebrow">Functional Movement Screen</p>
+        <h1>Run the seven-pattern FMS in a fixed order.</h1>
+        <p class="section-copy">
+          Heavy MediaPipe pose tracking verifies setup, captures movement attempts, stores FMS history, and keeps the official seven-pattern order locked from start to finish.
+        </p>
+        <div class="hero-badges">
+          <span class="pill">7 patterns</span>
+          <span class="pill">Fixed order</span>
+          <span class="pill">Pain aware</span>
+          <span class="pill">Heavy pose model</span>
+        </div>
+      </div>
+
+      ${sexPromptMarkup}
+
+      <div class="card fms-card">
+        <div class="section-head">
+          <p class="eyebrow">Safety</p>
+          <h2>Mandatory disclaimer</h2>
+          <p class="section-copy">${escapeHtml(fmsDisclaimer)}</p>
+        </div>
+        <label class="checkbox-row">
+          <input id="fms-disclaimer-checkbox" type="checkbox">
+          <span>I understand that this is a screening tool and not a diagnosis.</span>
+        </label>
+      </div>
+
+      <div class="card fms-card">
+        <div class="section-head">
+          <p class="eyebrow">Equipment</p>
+          <h2>Prepare the full setup first</h2>
+        </div>
+        <ul class="bullet-list">
+          ${fmsRequiredEquipment.map((item) => `<li>${escapeHtml(item)}</li>`).join('')}
+        </ul>
+        <div class="fms-note-stack">
+          ${fmsEquipmentNotes.map((item) => `<p class="results-note">${escapeHtml(item)}</p>`).join('')}
+        </div>
+        <label class="checkbox-row">
+          <input id="fms-equipment-checkbox" type="checkbox">
+          <span>All required equipment is ready and visible enough for the test.</span>
+        </label>
+      </div>
+
+      <div class="action-bar">
+        <button class="primary-button" data-fms-action="start" type="button">Start FMS</button>
+      </div>
+
+      ${latestSummaryMarkup}
+
+      <div class="card history-card">
+        <div class="section-head tight">
+          <p class="eyebrow">FMS history</p>
+          <h2>Recent screens</h2>
+        </div>
+        <div>${buildFmsHistoryMarkup()}</div>
+      </div>
+    `;
+        return;
+    }
+    if (!task) {
+        void stopFmsCameraResources({ closeLandmarker: true });
+        els.fmsRoot.innerHTML = latestSummaryMarkup;
+        return;
+    }
+    const review = state.fms.camera.review;
+    const taskTitle = `${task.patternName}${task.side ? ` · ${task.side}` : ''}`;
+    if (task.kind === 'movement') {
+        const cameraCardMarkup = review
+            ? `
+          <div class="card fms-card">
+            <div class="section-head">
+              <p class="eyebrow">Capture review</p>
+              <h2>Detected score ${review.score}</h2>
+              <p class="section-copy">
+                Confidence ${Math.round(review.confidence * 100)}%. Review the notes below, then report pain if needed before continuing.
+              </p>
+            </div>
+            ${renderFmsCaptureMetrics(review.metrics)}
+            <div class="fms-note-stack">
+              ${review.notes.length === 0 ? '<p class="results-note">No extra capture notes were generated for this attempt.</p>' : review.notes.map((item) => `<p class="results-note">${escapeHtml(item)}</p>`).join('')}
+            </div>
+            <div class="action-bar">
+              ${reviewActionMarkup(task, review)}
+            </div>
+          </div>
+        `
+            : `
+          <div class="card camera-card fms-live-camera-card">
+            <div class="camera-stage">
+              <video id="fms-camera-video" class="camera-video" autoplay muted playsinline></video>
+              <canvas id="fms-camera-canvas" class="camera-canvas"></canvas>
+              <div class="camera-gradient"></div>
+              <div class="camera-hud">
+                <div class="camera-stats">
+                  <div class="camera-stat">
+                    <span>View</span>
+                    <strong>${escapeHtml(task.cameraView)}</strong>
+                  </div>
+                  <div class="camera-stat">
+                    <span>Model</span>
+                    <strong>Pose heavy</strong>
+                  </div>
+                </div>
+                <span class="status-pill camera-status" id="fms-camera-status">Loading camera</span>
+              </div>
+            </div>
+            <p class="section-copy" id="fms-camera-guidance">Loading the heavy pose model and opening the camera.</p>
+            <p class="camera-error" id="fms-camera-error" hidden></p>
+          </div>
+        `;
+        els.fmsRoot.innerHTML = `
+      <div class="card fms-card">
+        <div class="section-head">
+          <p class="eyebrow">${escapeHtml(progressLabel)}</p>
+          <h2>${escapeHtml(taskTitle)}</h2>
+          <p class="section-copy">
+            ${escapeHtml(task.cameraView)}. Hold still for position lock, wait for the green ready state, then perform the movement once.
+          </p>
+        </div>
+        <div class="hero-badges">
+          ${task.equipment.map((item) => `<span class="pill">${escapeHtml(item)}</span>`).join('')}
+        </div>
+        <ul class="bullet-list">
+          ${task.instructions.map((item) => `<li>${escapeHtml(item)}</li>`).join('')}
+        </ul>
+        <div class="action-bar">
+          <button class="secondary-button" data-fms-action="voice" type="button">Read instructions aloud</button>
+          <button class="secondary-button" data-fms-action="restart-camera" type="button">Restart camera</button>
+        </div>
+      </div>
+
+      ${cameraCardMarkup}
+
+      <div class="card fms-card">
+        <div class="section-head">
+          <p class="eyebrow">Pain and notes</p>
+          <h2>Finish this step</h2>
+          <p class="section-copy">${escapeHtml(task.painPrompt)}</p>
+        </div>
+        <label class="checkbox-row">
+          <input id="fms-pain-checkbox" type="checkbox">
+          <span>Pain was present during this movement.</span>
+        </label>
+        <label class="field">
+          <span>Notes</span>
+          <textarea id="fms-note-input" rows="4" placeholder="Optional notes about balance loss, compensation, asymmetry, or setup issues."></textarea>
+        </label>
+      </div>
+
+      <div class="action-bar">
+        <button class="secondary-button" data-fms-action="quit" type="button">Save and stop</button>
+        <button class="primary-button" data-fms-action="advance" type="button">${state.fms.currentTaskIndex === tasks.length - 1 ? 'Finish FMS' : 'Next step'}</button>
+      </div>
+    `;
+        if (!review && state.screen === 'fms') {
+            void startFmsMovementCapture(task, state.fms.camera.mode);
         }
-    };
-}
-function buildSchedule(programKey) {
-    const program = getProgramDefinition(programKey);
-    if (program.kind === 'sequence') {
-        return buildSequenceSchedule(program.sequence);
-    }
-    return buildIntensiveSchedule(program.groups);
-}
-function buildIntensiveSchedule(groups) {
-    const schedule = [];
-    const items = [];
-    groups.forEach((group) => {
-        const exercises = group.exercises;
-        const maxSets = Math.max(...exercises.map(ex => ex.sets || 0));
-        for (let round = 1; round <= maxSets; round++) {
-            exercises.forEach(exercise => {
-                if (round > (exercise.sets || 0))
-                    return;
-                items.push({ exercise, round });
-            });
+        else {
+            updateFmsCameraFeedback(null);
         }
-    });
-    items.forEach((item, idx) => {
-        const segments = createSetSegments(item.exercise, item.round, true);
-        schedule.push(...segments);
-        const restBetweenSets = typeof item.exercise.rest === 'number' ? item.exercise.rest : 0;
-        if (restBetweenSets <= 0)
-            return;
-        const hasNextExercise = idx < items.length - 1;
-        const endsWithRest = segments[segments.length - 1]?.phase === 'setRest';
-        if (hasNextExercise && !endsWithRest) {
-            schedule.push({
-                exerciseName: item.exercise.name,
-                routine: item.exercise.routine,
-                set: item.round,
-                totalSets: item.exercise.sets,
-                rep: null,
-                totalReps: null,
-                phase: 'setRest',
-                type: 'rest',
-                duration: restBetweenSets,
-                group: item.exercise.group || null,
-                tempoParts: {
-                    setRest: restBetweenSets
-                }
-            });
+        return;
+    }
+    void stopFmsCameraResources({ preserveReview: false });
+    els.fmsRoot.innerHTML = `
+    <div class="card fms-card">
+      <div class="section-head">
+        <p class="eyebrow">${escapeHtml(progressLabel)}</p>
+        <h2>${escapeHtml(taskTitle)}</h2>
+        <p class="section-copy">
+          ${escapeHtml(task.cameraView)}. This clearing step only records whether pain is present.
+        </p>
+      </div>
+      <div class="hero-badges">
+        ${task.equipment.map((item) => `<span class="pill">${escapeHtml(item)}</span>`).join('')}
+      </div>
+      <ul class="bullet-list">
+        ${task.instructions.map((item) => `<li>${escapeHtml(item)}</li>`).join('')}
+      </ul>
+      <div class="action-bar">
+        <button class="secondary-button" data-fms-action="voice" type="button">Read instructions aloud</button>
+      </div>
+    </div>
+
+    <div class="card fms-card">
+      <div class="section-head">
+        <p class="eyebrow">Clearing test</p>
+        <h2>Record pain only</h2>
+        <p class="section-copy">${escapeHtml(task.painPrompt)}</p>
+      </div>
+      <label class="checkbox-row">
+        <input id="fms-pain-checkbox" type="checkbox">
+        <span>Pain was present during this clearing test.</span>
+      </label>
+      <label class="field">
+        <span>Notes</span>
+        <textarea id="fms-note-input" rows="4" placeholder="Optional notes about the clearing response."></textarea>
+      </label>
+    </div>
+
+    <div class="action-bar">
+      <button class="secondary-button" data-fms-action="quit" type="button">Save and stop</button>
+      <button class="primary-button" data-fms-action="advance" type="button">${state.fms.currentTaskIndex === tasks.length - 1 ? 'Finish FMS' : 'Next step'}</button>
+    </div>
+  `;
+}
+function getCurrentFmsTask() {
+    const user = state.activeUser;
+    const draft = state.fms.draft;
+    if (!user || !draft)
+        return null;
+    return createFmsTasks(draft.sexForTSPU ?? user.sexForTSPU)[state.fms.currentTaskIndex] ?? null;
+}
+function appendPatternNote(pattern, note) {
+    const trimmed = note.trim();
+    if (trimmed === '')
+        return;
+    pattern.notes = Array.from(new Set([...pattern.notes, trimmed.slice(0, 220)])).slice(0, 8);
+}
+function applyFmsTaskResult(draft, task, score, pain, note, options = {}) {
+    const next = cloneFmsDraft(draft);
+    const pattern = next.patterns[task.patternKey];
+    if (task.kind === 'movement') {
+        if (score === null) {
+            throw new Error('A score is required for this movement.');
         }
-    });
-    if (PREP_DELAY_SECONDS > 0)
-        schedule.unshift(createPrepSegment());
-    return schedule;
-}
-function createRestSegment(exercise, setNumber, restSeconds) {
-    return {
-        exerciseName: exercise.name,
-        routine: exercise.routine,
-        set: setNumber,
-        totalSets: exercise.sets,
-        rep: null,
-        totalReps: null,
-        phase: 'setRest',
-        type: 'rest',
-        duration: restSeconds,
-        group: exercise.group || null,
-        tempoParts: {
-            setRest: restSeconds
+        if (task.side === 'left') {
+            pattern.rawLeft = pain ? 0 : score;
         }
-    };
-}
-function buildSequenceSchedule(sequence) {
-    const schedule = [];
-    const totalsByName = sequence.reduce((acc, exercise) => {
-        acc[exercise.name] = (acc[exercise.name] ?? 0) + 1;
-        return acc;
-    }, {});
-    const occurrenceByName = {};
-    sequence.forEach((exercise, index) => {
-        occurrenceByName[exercise.name] = (occurrenceByName[exercise.name] ?? 0) + 1;
-        const setNumber = occurrenceByName[exercise.name];
-        const totalSets = totalsByName[exercise.name] || exercise.sets || 1;
-        const resolved = totalSets !== exercise.sets ? { ...exercise, sets: totalSets } : exercise;
-        const segments = createSetSegments(resolved, setNumber, false);
-        schedule.push(...segments);
-        const restAfter = typeof resolved.rest === 'number' ? resolved.rest : 0;
-        const hasNext = index < sequence.length - 1;
-        if (hasNext && restAfter > 0) {
-            schedule.push(createRestSegment(resolved, setNumber, restAfter));
+        else {
+            pattern.rawRight = pain ? 0 : score;
         }
-    });
-    if (PREP_DELAY_SECONDS > 0)
-        schedule.unshift(createPrepSegment());
-    return schedule;
-}
-function startSession() {
-    if (state.animationId)
-        cancelAnimationFrame(state.animationId);
-    state.animationId = null;
-    state.schedule = buildSchedule(state.programKey);
-    state.pointer = 0;
-    state.completedMs = 0;
-    state.lastCountdownSecond = null;
-    const sessionTotalSeconds = state.schedule.reduce((sum, seg) => sum + seg.duration, 0);
-    state.sessionTotalMs = sessionTotalSeconds * 1000;
-    if (!state.schedule.length) {
-        els.currentRemaining.textContent = '--';
-        state.status = 'idle';
-        updateStatusChip();
-        return;
-    }
-    state.status = 'running';
-    updateStatusChip();
-    els.start.textContent = 'Resetar';
-    els.pause.textContent = 'Pausar';
-    els.pause.disabled = false;
-    els.sessionRemaining.textContent = formatSeconds(Math.ceil(state.sessionTotalMs / 1000));
-    setPlayerActive(true);
-    startMusic();
-    startSegment(state.schedule[state.pointer]);
-}
-function pauseSession() {
-    if (state.animationId)
-        cancelAnimationFrame(state.animationId);
-    state.animationId = null;
-    state.status = 'paused';
-    updateStatusChip();
-    els.pause.textContent = 'Retomar';
-    pauseMusic();
-}
-function resumeSession() {
-    if (!state.schedule.length)
-        return;
-    state.status = 'running';
-    updateStatusChip();
-    els.pause.textContent = 'Pausar';
-    resumeMusic();
-    const elapsedBeforePause = state.segmentDurationMs - state.remainingMs;
-    state.segmentStartedAt = performance.now() - elapsedBeforePause;
-    state.lastCountdownSecond = null;
-    const current = currentSegment();
-    if (current) {
-        playCueTone(current);
-        updatePlayerUI();
-        state.animationId = requestAnimationFrame(tick);
-    }
-}
-function resetSession(updateChip = true) {
-    if (state.animationId)
-        cancelAnimationFrame(state.animationId);
-    state.animationId = null;
-    state.status = 'idle';
-    state.schedule = [];
-    state.pointer = 0;
-    state.completedMs = 0;
-    state.sessionTotalMs = 0;
-    state.segmentDurationMs = 0;
-    state.remainingMs = 0;
-    els.start.textContent = 'Iniciar';
-    els.pause.textContent = 'Pausar';
-    els.pause.disabled = true;
-    els.currentTitle.textContent = 'Pronto para começar';
-    els.currentDetail.textContent = 'Toque em iniciar para começar o treino.';
-    els.currentRemaining.textContent = '--';
-    setPhasePill(null);
-    els.progressBar.style.width = '0%';
-    els.segmentProgressBar.style.width = '0%';
-    els.segmentProgressWrap.hidden = true;
-    els.phaseBlocks.hidden = true;
-    const summary = computeProgramSummary(state.programKey);
-    els.sessionRemaining.textContent = formatSeconds(summary.totalSeconds);
-    if (updateChip)
-        updateStatusChip();
-    clearActiveCards();
-    setPlayerActive(false);
-    pauseMusic(true);
-}
-function openTrainingConfirm(action) {
-    if (state.status === 'running') {
-        pauseSession();
-    }
-    pendingConfirmAction = action;
-    els.confirmMessage.textContent = EXIT_TRAINING_MESSAGE;
-    els.confirmOverlay.hidden = false;
-}
-function closeTrainingConfirm() {
-    pendingConfirmAction = null;
-    els.confirmOverlay.hidden = true;
-}
-function handleTrainingConfirm() {
-    const action = pendingConfirmAction;
-    closeTrainingConfirm();
-    if (!action)
-        return;
-    if (action === 'leave') {
-        resetSession();
-        showScreen('details');
-        return;
-    }
-    resetSession();
-}
-function setPlayerActive(isActive) {
-    els.playerMain.hidden = !isActive;
-    els.playerPlaceholder.hidden = isActive;
-}
-function startSegment(segment) {
-    state.segmentDurationMs = segment.duration * 1000;
-    state.remainingMs = state.segmentDurationMs;
-    state.segmentStartedAt = performance.now();
-    state.lastCountdownSecond = null;
-    playCueTone(segment);
-    els.segmentProgressBar.style.width = '0%';
-    updatePlayerUI();
-    tick();
-}
-function tick(now) {
-    if (state.status !== 'running')
-        return;
-    if (!now) {
-        state.animationId = requestAnimationFrame(tick);
-        return;
-    }
-    const elapsed = now - state.segmentStartedAt;
-    state.remainingMs = Math.max(0, state.segmentDurationMs - elapsed);
-    updatePlayerUI();
-    handleCountdownBeep();
-    if (state.remainingMs <= 0) {
-        advanceSegment();
-        return;
-    }
-    state.animationId = requestAnimationFrame(tick);
-}
-function advanceSegment() {
-    state.completedMs += state.segmentDurationMs;
-    state.pointer += 1;
-    if (state.pointer >= state.schedule.length) {
-        finishSession();
-        return;
-    }
-    const next = state.schedule[state.pointer];
-    startSegment(next);
-}
-function finishSession() {
-    if (state.animationId)
-        cancelAnimationFrame(state.animationId);
-    state.animationId = null;
-    state.status = 'done';
-    updateStatusChip();
-    els.pause.disabled = true;
-    els.currentRemaining.textContent = '00:00';
-    els.sessionRemaining.textContent = formatSeconds(0);
-    els.progressBar.style.width = '100%';
-    els.segmentProgressBar.style.width = '100%';
-    setPhasePill(null, { label: 'Concluído', tone: 0 });
-    playTone(1020, 0.25);
-    pauseMusic(true);
-    const entry = recordCompletion();
-    renderCompletion(entry);
-    renderHistory();
-    showScreen('complete');
-}
-function currentSegment() {
-    return state.schedule[state.pointer];
-}
-function updatePlayerUI() {
-    const segment = currentSegment();
-    const remainingSec = Math.max(0, Math.ceil(state.remainingMs / 1000));
-    els.currentRemaining.textContent = remainingSec ? formatSeconds(remainingSec) : '00:00';
-    if (!segment) {
-        els.segmentProgressBar.style.width = '0%';
-        els.phaseBlocks.innerHTML = '';
-        els.segmentProgressWrap.hidden = true;
-        els.phaseBlocks.hidden = true;
-        return;
-    }
-    const phase = phaseMeta[segment.phase] ?? { label: segment.phase, tone: 0 };
-    const repText = segment.totalReps && segment.totalReps > 1 && segment.rep
-        ? `Repetição ${segment.rep}/${segment.totalReps}`
-        : '';
-    const setText = segment.totalSets && segment.totalSets > 1 ? `Série ${segment.set}/${segment.totalSets}` : '';
-    const setRep = [setText, repText].filter(Boolean).join(' · ');
-    els.currentTitle.textContent = `${segment.exerciseName}`;
-    els.currentDetail.textContent = setRep || '';
-    setPhasePill(segment, phase);
-    renderPhaseBlocks(segment);
-    const remainingSessionMs = (state.sessionTotalMs || 0) - (state.completedMs + (state.segmentDurationMs - state.remainingMs));
-    els.sessionRemaining.textContent = formatSeconds(Math.max(0, Math.ceil(remainingSessionMs / 1000)));
-    const progress = ((state.completedMs + (state.segmentDurationMs - state.remainingMs)) / (state.sessionTotalMs || 1)) * 100;
-    els.progressBar.style.width = `${Math.min(100, progress)}%`;
-    const segmentProgress = ((state.segmentDurationMs - state.remainingMs) / (state.segmentDurationMs || 1)) * 100;
-    els.segmentProgressBar.style.width = `${Math.min(100, segmentProgress)}%`;
-    const showRestProgress = segment.type === 'rest';
-    els.segmentProgressWrap.hidden = !showRestProgress;
-    els.phaseBlocks.hidden = showRestProgress;
-    highlightActiveCard(segment.exerciseName);
-    renderNextDuringRest();
-}
-function formatSeconds(totalSeconds) {
-    const secs = Math.max(0, Math.round(totalSeconds));
-    const m = Math.floor(secs / 60);
-    const s = secs % 60;
-    return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
-}
-function setPhasePill(segment, phase) {
-    const pill = els.phasePill;
-    pill.className = 'phase-pill';
-    if (!segment) {
-        pill.textContent = phase?.label ?? 'Pronto';
-        if (phase)
-            pill.classList.add('rest');
-        return;
-    }
-    const typeLabel = segment.type;
-    const typeClass = typeLabel.includes('rest')
-        ? 'rest'
-        : typeLabel === 'hold'
-            ? 'hold'
-            : 'movement';
-    pill.classList.add(typeClass);
-    pill.textContent = phase?.label || segment.phase || 'Etapa';
-}
-function findRepRange(pointer) {
-    const seg = state.schedule[pointer];
-    if (!seg)
-        return { start: pointer, end: pointer };
-    let start = pointer;
-    while (start - 1 >= 0) {
-        const prev = state.schedule[start - 1];
-        if (prev.exerciseName === seg.exerciseName &&
-            prev.set === seg.set &&
-            prev.rep === seg.rep) {
-            start--;
+        if (pain) {
+            pattern.pain = true;
         }
-        else
-            break;
     }
-    let end = pointer;
-    while (end + 1 < state.schedule.length) {
-        const next = state.schedule[end + 1];
-        if (next.exerciseName === seg.exerciseName &&
-            next.set === seg.set &&
-            next.rep === seg.rep) {
-            end++;
-        }
-        else
-            break;
+    else if (pain) {
+        pattern.clearingPain = true;
     }
-    return { start, end };
+    if (typeof options.confidence === 'number') {
+        pattern.confidence = Math.min(pattern.confidence, options.confidence);
+    }
+    if (pain) {
+        appendPatternNote(pattern, `${task.patternName}: pain reported.`);
+    }
+    for (const generatedNote of options.autoNotes ?? []) {
+        appendPatternNote(pattern, generatedNote);
+    }
+    if (note.trim() !== '') {
+        appendPatternNote(pattern, task.side ? `${task.side}: ${note.trim()}` : note.trim());
+    }
+    return recalculateFmsDraft(next);
 }
-function renderPhaseBlocks(segment) {
-    const tempoParts = segment.tempoParts || {};
-    const order = ['go', 'pause', 'return', 'rest', 'hold', 'setRest'];
-    const colorMap = {
-        go: 'var(--accent)',
-        pause: 'var(--accent-2)',
-        return: '#8be0ff',
-        rest: 'rgba(255,255,255,0.3)',
-        setRest: 'rgba(255,255,255,0.3)',
-        hold: 'var(--accent)',
-        prep: 'rgba(255,255,255,0.3)'
-    };
-    let unitCounter = 0;
-    const blocks = [];
-    order.forEach(key => {
-        const duration = Math.round(tempoParts[key] || 0);
-        if (duration <= 0)
-            return;
-        for (let i = 0; i < duration; i++) {
-            blocks.push({
-                phase: key,
-                color: colorMap[key] || 'var(--accent)',
-                unitIndex: unitCounter
-            });
-            unitCounter++;
-        }
-    });
-    if (!blocks.length) {
-        els.phaseBlocks.innerHTML = '<span class="phase-block empty"></span>';
-        return;
-    }
-    const { start } = findRepRange(state.pointer);
-    let elapsedBeforeCurrent = 0;
-    for (let i = start; i < state.pointer; i++) {
-        elapsedBeforeCurrent += (state.schedule[i].duration || 0);
-    }
-    const currentElapsed = (state.segmentDurationMs - state.remainingMs) / 1000;
-    const repElapsed = elapsedBeforeCurrent + currentElapsed;
-    const unitIndex = Math.max(0, Math.min(unitCounter - 1, Math.floor(repElapsed)));
-    const currentBlockIndex = blocks.findIndex(b => b.unitIndex === unitIndex);
-    const html = blocks
-        .map((block, idx) => {
-        const cls = ['phase-block'];
-        if (idx === currentBlockIndex)
-            cls.push('current');
-        const style = block.color ? `style="background:${block.color}"` : '';
-        return `<span class="${cls.join(' ')}" ${style}></span>`;
-    })
-        .join('');
-    els.phaseBlocks.innerHTML = html;
-}
-function updateStatusChip() {
-    els.statusChip.classList.remove('is-paused', 'is-running', 'is-idle');
-    if (state.status === 'running') {
-        els.statusChip.classList.add('is-running');
-        els.statusChip.setAttribute('aria-label', 'Em andamento');
-    }
-    else if (state.status === 'paused') {
-        els.statusChip.classList.add('is-paused');
-        els.statusChip.setAttribute('aria-label', 'Pausado');
-    }
-    else if (state.status === 'done') {
-        els.statusChip.classList.add('is-idle');
-        els.statusChip.setAttribute('aria-label', 'Concluído');
-    }
-    else {
-        els.statusChip.classList.add('is-idle');
-        els.statusChip.setAttribute('aria-label', 'Pronto');
-    }
-    updateButtons();
-}
-function updateButtons() {
-    if (state.status === 'running') {
-        setButtonStyle(els.pause, { primary: true });
-        setButtonStyle(els.start, { primary: false });
-    }
-    else if (state.status === 'paused') {
-        setButtonStyle(els.pause, { primary: true });
-        setButtonStyle(els.start, { primary: false });
-    }
-    else {
-        setButtonStyle(els.pause, { primary: false });
-        setButtonStyle(els.start, { primary: true });
-    }
-}
-function highlightActiveCard(name) {
-    clearActiveCards();
-    if (!name)
-        return;
-    const card = els.detailExerciseList.querySelector(`[data-exercise-card="${name}"]`);
-    if (card)
-        card.classList.add('is-live');
-}
-function clearActiveCards() {
-    els.detailExerciseList.querySelectorAll('.exercise-card.is-live').forEach(card => card.classList.remove('is-live'));
-}
-function renderNextDuringRest() {
-    const current = currentSegment();
-    if (!current || (current.phase !== 'setRest' && current.phase !== 'prep'))
-        return;
-    const next = state.schedule[state.pointer + 1];
-    if (!next)
-        return;
-    const nextPhase = phaseMeta[next.phase] ?? { label: next.phase, tone: 0 };
-    const nextSetRep = [
-        next.totalSets && next.totalSets > 1 ? `Série ${next.set}/${next.totalSets}` : '',
-        next.totalReps && next.totalReps > 1 && next.rep
-            ? `Repetição ${next.rep}/${next.totalReps}`
-            : ''
-    ]
-        .filter(Boolean)
-        .join(' · ');
-    els.currentTitle.textContent = `Próximo: ${next.exerciseName}`;
-    els.currentDetail.textContent = [nextPhase.label, nextSetRep].filter(Boolean).join(' • ');
-}
-function buildShareCardStats(entry) {
-    return {
-        trainingName: entry.trainingName,
-        xpEarned: entry.xpEarned,
-        sessionTime: formatSeconds(entry.durationSeconds),
-        streak: getCurrentStreak(historyEntries),
-        totalXp: getTotalXp(historyEntries)
-    };
-}
-function buildShareMessage(stats) {
-    return [
-        `NoSkip | ${stats.trainingName}`,
-        `XP: ${stats.xpEarned}`,
-        `Tempo: ${stats.sessionTime}`,
-        `Streak: ${formatStreak(stats.streak)}`,
-        `Total XP: ${stats.totalXp}`
-    ].join(' · ');
-}
-async function shareCompletion(target) {
-    const entry = latestCompletionEntry;
-    if (!entry)
-        return;
+async function persistFmsDraft(nextDraft) {
     try {
-        const stats = buildShareCardStats(entry);
-        const message = buildShareMessage(stats);
-        const blob = await createShareCardBlob(stats);
-        const filename = `noskip-${Date.now()}.png`;
-        const file = new File([blob], filename, { type: 'image/png' });
-        const shared = await shareNatively(file, message);
-        if (!shared) {
-            downloadBlob(blob, filename);
-            openShareFallback(target, message);
-        }
-    }
-    catch {
-        // silent failure keeps UI responsive even when share APIs are unavailable
-    }
-    finally {
-        els.completeShareTargets.hidden = true;
-    }
-}
-async function shareNatively(file, message) {
-    const nav = navigator;
-    if (!nav.share)
-        return false;
-    try {
-        const supportsFiles = typeof nav.canShare === 'function' ? nav.canShare({ files: [file] }) : false;
-        if (supportsFiles) {
-            await nav.share({
-                title: 'NoSkip',
-                text: message,
-                files: [file]
-            });
-            return true;
-        }
-        await nav.share({ title: 'NoSkip', text: message });
+        voiceCoach.stop();
+        await stopFmsCameraResources({ closeLandmarker: true });
+        const saved = await saveFmsSession(nextDraft);
+        state.fms.latestSession = saved;
+        await refreshUserData();
+        state.fms.draft = null;
+        state.fms.currentTaskIndex = 0;
+        state.fms.camera.mode = 'primary';
+        setActiveScreen('fms');
+        renderApp();
         return true;
     }
-    catch {
+    catch (error) {
+        window.alert(error instanceof Error ? error.message : 'The FMS session could not be saved to the backend.');
         return false;
     }
 }
-function downloadBlob(blob, filename) {
-    const url = URL.createObjectURL(blob);
-    const anchor = document.createElement('a');
-    anchor.href = url;
-    anchor.download = filename;
-    document.body.append(anchor);
-    anchor.click();
-    anchor.remove();
-    URL.revokeObjectURL(url);
-}
-function openShareFallback(target, message) {
-    if (navigator.clipboard) {
-        void navigator.clipboard.writeText(message).catch(() => undefined);
+async function saveAndExitFms(status) {
+    const draft = state.fms.draft;
+    if (!draft)
+        return;
+    const next = recalculateFmsDraft(cloneFmsDraft(draft));
+    next.status = status;
+    next.completedAt = new Date().toISOString();
+    if (status !== 'completed') {
+        next.totalScore = undefined;
     }
-    if (target === 'x') {
-        const url = `https://x.com/intent/tweet?text=${encodeURIComponent(message)}`;
-        window.open(url, '_blank', 'noopener');
+    await persistFmsDraft(next);
+}
+async function startFmsFlow() {
+    const user = state.activeUser;
+    if (!user)
+        return;
+    if (user.sexForTSPU === 'unspecified') {
+        window.alert('Save the sex used for the Trunk Stability Push-Up standard before starting the FMS flow.');
         return;
     }
-    window.open('https://www.instagram.com/', '_blank', 'noopener');
-}
-async function createShareCardBlob(stats) {
-    const canvas = document.createElement('canvas');
-    canvas.width = SHARE_CARD_WIDTH;
-    canvas.height = SHARE_CARD_HEIGHT;
-    const ctx = canvas.getContext('2d');
-    if (!ctx) {
-        throw new Error('Canvas context unavailable.');
+    const disclaimerAccepted = document.querySelector('#fms-disclaimer-checkbox')?.checked ?? false;
+    const equipmentConfirmed = document.querySelector('#fms-equipment-checkbox')?.checked ?? false;
+    if (!disclaimerAccepted) {
+        window.alert('You must accept the screening disclaimer before starting.');
+        return;
     }
-    drawShareCard(ctx, stats, canvas.width, canvas.height);
-    return canvasToBlob(canvas);
-}
-function drawShareCard(ctx, stats, width, height) {
-    const background = ctx.createLinearGradient(0, 0, width, height);
-    background.addColorStop(0, '#090f1d');
-    background.addColorStop(1, '#101c33');
-    ctx.fillStyle = background;
-    ctx.fillRect(0, 0, width, height);
-    const glowA = ctx.createRadialGradient(width * 0.1, height * 0.12, 10, width * 0.1, height * 0.12, width * 0.62);
-    glowA.addColorStop(0, 'rgba(14, 222, 196, 0.34)');
-    glowA.addColorStop(1, 'rgba(14, 222, 196, 0)');
-    ctx.fillStyle = glowA;
-    ctx.fillRect(0, 0, width, height);
-    const glowB = ctx.createRadialGradient(width * 0.84, height * 0.06, 10, width * 0.84, height * 0.06, width * 0.5);
-    glowB.addColorStop(0, 'rgba(255, 140, 66, 0.34)');
-    glowB.addColorStop(1, 'rgba(255, 140, 66, 0)');
-    ctx.fillStyle = glowB;
-    ctx.fillRect(0, 0, width, height);
-    const panelX = 62;
-    const panelY = 62;
-    const panelWidth = width - panelX * 2;
-    const panelHeight = height - panelY * 2;
-    drawRoundedRect(ctx, panelX, panelY, panelWidth, panelHeight, 40);
-    ctx.fillStyle = 'rgba(8, 15, 30, 0.9)';
-    ctx.fill();
-    ctx.strokeStyle = 'rgba(255, 255, 255, 0.1)';
-    ctx.lineWidth = 2;
-    ctx.stroke();
-    ctx.fillStyle = '#9bc0e3';
-    ctx.font = '700 30px "Space Grotesk", "DM Sans", sans-serif';
-    ctx.textAlign = 'left';
-    ctx.fillText('RESULTADO NO SKIP', panelX + 52, panelY + 92);
-    ctx.fillStyle = '#f4f8ff';
-    ctx.font = '800 58px "Space Grotesk", "DM Sans", sans-serif';
-    const textY = drawWrappedText(ctx, stats.trainingName, panelX + 52, panelY + 158, panelWidth - 104, 68, 2);
-    const cardWidth = (panelWidth - 124) / 2;
-    const cardHeight = 166;
-    const cardTop = textY + 42;
-    const left = panelX + 52;
-    const right = left + cardWidth + 20;
-    drawStatCard(ctx, {
-        x: left,
-        y: cardTop,
-        width: cardWidth,
-        height: cardHeight,
-        label: 'XP',
-        value: `${stats.xpEarned}`,
-        accent: '#3fa9f5',
-        fill: 'rgba(63, 169, 245, 0.15)'
+    if (!equipmentConfirmed) {
+        window.alert('Confirm the equipment setup before starting.');
+        return;
+    }
+    state.fms.draft = createNewFmsDraft(user, disclaimerAccepted, equipmentConfirmed);
+    state.fms.currentTaskIndex = 0;
+    state.fms.camera.mode = 'primary';
+    state.fms.camera.review = null;
+    renderApp();
+    voiceCoach.stop();
+    voiceCoach.speak({
+        key: 'fms-opening',
+        message: `${fmsVoiceDisclaimer} ${fmsOpeningVoice}`,
+        interrupt: true,
+        minIntervalMs: 0
     });
-    drawStatCard(ctx, {
-        x: right,
-        y: cardTop,
-        width: cardWidth,
-        height: cardHeight,
-        label: 'TEMPO',
-        value: stats.sessionTime,
-        accent: '#6dd6ff',
-        fill: 'rgba(109, 214, 255, 0.15)'
-    });
-    drawStatCard(ctx, {
-        x: left,
-        y: cardTop + cardHeight + 20,
-        width: cardWidth,
-        height: cardHeight,
-        label: 'STREAK',
-        value: formatStreak(stats.streak),
-        accent: '#ff9a4d',
-        fill: 'rgba(255, 154, 77, 0.18)'
-    });
-    drawStatCard(ctx, {
-        x: right,
-        y: cardTop + cardHeight + 20,
-        width: cardWidth,
-        height: cardHeight,
-        label: 'TOTAL XP',
-        value: `${stats.totalXp}`,
-        accent: '#ffe08f',
-        fill: 'rgba(255, 224, 143, 0.16)'
-    });
-    drawNoSkipLogo(ctx, width / 2, panelY + panelHeight - 104);
 }
-function drawStatCard(ctx, opts) {
-    drawRoundedRect(ctx, opts.x, opts.y, opts.width, opts.height, 24);
-    ctx.fillStyle = opts.fill;
-    ctx.fill();
-    ctx.strokeStyle = opts.accent;
-    ctx.lineWidth = 2;
-    ctx.stroke();
-    ctx.fillStyle = opts.accent;
-    ctx.font = '700 24px "Space Grotesk", "DM Sans", sans-serif';
-    ctx.textAlign = 'left';
-    ctx.fillText(opts.label, opts.x + 24, opts.y + 50);
-    ctx.fillStyle = '#f5fbff';
-    ctx.font = '800 44px "Space Grotesk", "DM Sans", sans-serif';
-    ctx.fillText(opts.value, opts.x + 24, opts.y + 118);
+async function saveFmsProfileSex() {
+    const select = document.querySelector('#fms-sex-select');
+    const value = select?.value === 'male' || select?.value === 'female' ? select.value : null;
+    if (!value) {
+        window.alert('Select male or female to save the FMS setup.');
+        return;
+    }
+    const result = await updateSexForTSPU(value);
+    if (!result.ok) {
+        window.alert(result.message ?? 'Could not update the profile.');
+        return;
+    }
+    await refreshUserData();
+    renderApp();
 }
-function drawNoSkipLogo(ctx, centerX, baselineY) {
-    ctx.save();
-    ctx.translate(centerX, baselineY);
-    ctx.textAlign = 'center';
-    drawRoundedRect(ctx, -190, -56, 380, 94, 24);
-    ctx.fillStyle = 'rgba(255, 255, 255, 0.06)';
-    ctx.fill();
-    ctx.strokeStyle = 'rgba(255, 255, 255, 0.18)';
-    ctx.lineWidth = 2;
-    ctx.stroke();
-    ctx.beginPath();
-    ctx.moveTo(-140, 2);
-    ctx.lineTo(-100, -20);
-    ctx.lineTo(-62, 2);
-    ctx.strokeStyle = '#0edec4';
-    ctx.lineWidth = 10;
-    ctx.lineCap = 'round';
-    ctx.stroke();
-    ctx.fillStyle = '#f2f8ff';
-    ctx.font = '800 42px "Space Grotesk", "DM Sans", sans-serif';
-    ctx.fillText('NoSkip', 42, 14);
-    ctx.restore();
-}
-function drawRoundedRect(ctx, x, y, width, height, radius) {
-    const r = Math.max(0, Math.min(radius, width / 2, height / 2));
-    ctx.beginPath();
-    ctx.moveTo(x + r, y);
-    ctx.lineTo(x + width - r, y);
-    ctx.quadraticCurveTo(x + width, y, x + width, y + r);
-    ctx.lineTo(x + width, y + height - r);
-    ctx.quadraticCurveTo(x + width, y + height, x + width - r, y + height);
-    ctx.lineTo(x + r, y + height);
-    ctx.quadraticCurveTo(x, y + height, x, y + height - r);
-    ctx.lineTo(x, y + r);
-    ctx.quadraticCurveTo(x, y, x + r, y);
-    ctx.closePath();
-}
-function drawWrappedText(ctx, text, x, y, maxWidth, lineHeight, maxLines) {
-    const words = text.trim().split(/\s+/).filter(Boolean);
-    if (!words.length)
-        return y;
-    let line = '';
-    let renderedLines = 0;
-    let drawY = y;
-    for (let idx = 0; idx < words.length; idx++) {
-        const word = words[idx];
-        const candidate = line ? `${line} ${word}` : word;
-        const width = ctx.measureText(candidate).width;
-        if (width <= maxWidth || !line) {
-            line = candidate;
-            continue;
+async function advanceFmsFlow() {
+    const draft = state.fms.draft;
+    const task = getCurrentFmsTask();
+    if (!draft || !task)
+        return;
+    const pain = document.querySelector('#fms-pain-checkbox')?.checked ?? false;
+    const note = document.querySelector('#fms-note-input')?.value ?? '';
+    const review = task.kind === 'movement' ? state.fms.camera.review : null;
+    const score = task.kind === 'movement' ? review?.score ?? null : null;
+    let nextDraft;
+    try {
+        if (task.kind === 'movement' && !review) {
+            throw new Error('Capture the movement before continuing.');
         }
-        ctx.fillText(line, x, drawY);
-        renderedLines += 1;
-        drawY += lineHeight;
-        line = word;
-        if (renderedLines >= maxLines - 1)
-            break;
+        nextDraft = applyFmsTaskResult(draft, task, score, pain, note, {
+            autoNotes: review?.notes,
+            confidence: review?.confidence
+        });
     }
-    if (renderedLines < maxLines && line) {
-        let finalLine = line;
-        if (ctx.measureText(finalLine).width > maxWidth) {
-            while (finalLine.length > 1 && ctx.measureText(`${finalLine}…`).width > maxWidth) {
-                finalLine = finalLine.slice(0, -1);
-            }
-            finalLine = `${finalLine}…`;
-        }
-        ctx.fillText(finalLine, x, drawY);
-        renderedLines += 1;
+    catch (error) {
+        window.alert(error instanceof Error ? error.message : 'This step is incomplete.');
+        return;
     }
-    return y + renderedLines * lineHeight;
-}
-function canvasToBlob(canvas) {
-    return new Promise((resolve, reject) => {
-        canvas.toBlob(blob => {
-            if (!blob) {
-                reject(new Error('Failed to create PNG blob.'));
-                return;
-            }
-            resolve(blob);
-        }, 'image/png');
-    });
-}
-function ensureAudio() {
-    if (!state.audioCtx) {
-        const AudioCtor = window.AudioContext ||
-            window.webkitAudioContext;
-        if (!AudioCtor)
+    if (pain) {
+        const continueAfterPain = window.confirm('Pain reported. This movement will be marked as pain present. Do you want to continue with the next step?');
+        if (!continueAfterPain) {
+            state.fms.draft = nextDraft;
+            await saveAndExitFms('stopped_pain');
             return;
-        state.audioCtx = new AudioCtor();
+        }
     }
-    if (state.audioCtx && state.audioCtx.state === 'suspended') {
-        state.audioCtx.resume();
-    }
-}
-function pulsePing() {
-    // removed visual ping
-}
-function playTone(frequency, duration = 0.12, volume = METRONOME_VOLUME) {
-    ensureAudio();
-    pulsePing();
-    if (!state.audioCtx)
-        return;
-    const ctx = state.audioCtx;
-    const osc = ctx.createOscillator();
-    const gain = ctx.createGain();
-    osc.frequency.value = frequency;
-    osc.type = 'sine';
-    gain.gain.setValueAtTime(volume, ctx.currentTime);
-    gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + duration);
-    osc.connect(gain).connect(ctx.destination);
-    osc.start();
-    osc.stop(ctx.currentTime + duration);
-}
-function playCueTone(segment) {
-    const meta = phaseMeta[segment.phase];
-    if (!meta) {
-        playTone(620);
+    const nextIndex = state.fms.currentTaskIndex + 1;
+    const tasks = createFmsTasks(nextDraft.sexForTSPU);
+    if (nextIndex >= tasks.length) {
+        const completedDraft = recalculateFmsDraft(nextDraft);
+        completedDraft.status = 'completed';
+        completedDraft.completedAt = new Date().toISOString();
+        await persistFmsDraft(completedDraft);
         return;
     }
-    if (meta.tone > 0) {
-        playTone(meta.tone);
+    state.fms.draft = nextDraft;
+    state.fms.currentTaskIndex = nextIndex;
+    state.fms.camera.mode = 'primary';
+    state.fms.camera.review = null;
+    renderApp();
+    const nextTask = tasks[nextIndex];
+    if (nextTask) {
+        voiceCoach.speak({
+            key: `fms-${nextTask.id}`,
+            message: nextTask.voiceScript,
+            interrupt: true,
+            minIntervalMs: 0
+        });
     }
 }
-function handleCountdownBeep() {
-    const remainingSec = Math.ceil(state.remainingMs / 1000);
-    if (remainingSec <= 3 && remainingSec !== state.lastCountdownSecond) {
-        state.lastCountdownSecond = remainingSec;
-        playTone(remainingSec === 1 ? 980 : 620, 0.08, METRONOME_VOLUME);
+function renderResults(session) {
+    const user = state.activeUser;
+    if (!user)
+        return;
+    setText(els.resultsName, user.name);
+    setText(els.resultsTotalReps, String(session.totalReps));
+    setText(els.resultsValidReps, String(session.validReps));
+    setText(els.resultsDepthScore, formatPercent(session.depthScore));
+    setText(els.resultsPostureScore, formatPercent(session.postureScore));
+    els.resultsNotes.innerHTML = '';
+    if (session.notes.length === 0) {
+        const note = document.createElement('div');
+        note.className = 'results-note';
+        note.textContent = 'Clean session. No persistent correction theme was detected.';
+        els.resultsNotes.append(note);
+        return;
+    }
+    for (const item of session.notes) {
+        const note = document.createElement('div');
+        note.className = 'results-note';
+        note.textContent = item;
+        els.resultsNotes.append(note);
     }
 }
-function ensureMusicPlayer() {
-    if (!MUSIC_TRACKS.length)
-        return null;
-    if (!musicPlayer) {
-        const audio = new Audio();
-        audio.preload = 'auto';
-        audio.volume = MUSIC_VOLUME;
-        audio.addEventListener('ended', () => {
-            if (state.status === 'running') {
-                playRandomTrack();
+function renderLiveSnapshot(snapshot) {
+    state.live.snapshot = snapshot;
+    const liveSetLabel = snapshot.phase === 'SESSION_COMPLETE'
+        ? `${squatTraining.session.protocol.sets} / ${squatTraining.session.protocol.sets}`
+        : `${snapshot.setNumber} / ${squatTraining.session.protocol.sets}`;
+    const liveRepLabel = snapshot.phase === 'SESSION_COMPLETE'
+        ? `${squatTraining.session.protocol.repsPerSet} / ${squatTraining.session.protocol.repsPerSet}`
+        : `${snapshot.repInSet} / ${squatTraining.session.protocol.repsPerSet}`;
+    const startPositionReady = snapshot.phase === 'READY' ||
+        snapshot.phase === 'DESCENDING' ||
+        snapshot.phase === 'BOTTOM' ||
+        snapshot.phase === 'ASCENDING' ||
+        snapshot.phase === 'SESSION_COMPLETE' ||
+        (snapshot.orientationAccepted && snapshot.startPostureOk);
+    setText(els.liveSetValue, liveSetLabel);
+    setText(els.liveRepValue, liveRepLabel);
+    els.orientationChip.className = 'status-pill camera-status';
+    if (snapshot.phase === 'REST') {
+        els.orientationChip.hidden = true;
+    }
+    else if (startPositionReady) {
+        els.orientationChip.hidden = false;
+        els.orientationChip.classList.add('is-ready');
+        setText(els.orientationChip, 'Starting position ready');
+    }
+    else {
+        els.orientationChip.hidden = false;
+        setText(els.orientationChip, 'Adjust position');
+    }
+    if (snapshot.phase === 'REST') {
+        els.restPill.hidden = false;
+        setText(els.restPill, `Rest ${Math.ceil(snapshot.restRemainingMs / 1000)}s`);
+    }
+    else {
+        els.restPill.hidden = true;
+    }
+    els.pauseToggleBtn.textContent = state.live.paused ? 'Resume' : 'Pause';
+}
+function syncNavigation() {
+    const isHome = state.screen === 'home';
+    const isFms = state.screen === 'fms';
+    const isProfile = state.screen === 'profile';
+    els.homeNavHome.classList.toggle('is-active', isHome);
+    els.homeNavFms.classList.toggle('is-active', isFms);
+    els.homeNavProfile.classList.toggle('is-active', isProfile);
+    els.fmsNavHome.classList.toggle('is-active', isHome);
+    els.fmsNavFms.classList.toggle('is-active', isFms);
+    els.fmsNavProfile.classList.toggle('is-active', isProfile);
+    els.profileNavHome.classList.toggle('is-active', isHome);
+    els.profileNavFms.classList.toggle('is-active', isFms);
+    els.profileNavProfile.classList.toggle('is-active', isProfile);
+}
+function renderApp() {
+    renderAuth();
+    if (!state.activeUser) {
+        setActiveScreen('auth');
+        return;
+    }
+    renderHome();
+    renderFms();
+    renderDetails();
+    renderProfile();
+    if (state.latestSession) {
+        renderResults(state.latestSession);
+    }
+    setActiveScreen(state.screen);
+    syncNavigation();
+}
+function handleEngineEvents(events) {
+    for (const event of events) {
+        voiceCoach.speak({
+            key: event.key,
+            message: event.message,
+            interrupt: event.interrupt
+        });
+    }
+}
+function syncCanvasToVideo() {
+    if (els.cameraVideo.videoWidth === 0 || els.cameraVideo.videoHeight === 0)
+        return;
+    if (els.cameraCanvas.width !== els.cameraVideo.videoWidth ||
+        els.cameraCanvas.height !== els.cameraVideo.videoHeight) {
+        els.cameraCanvas.width = els.cameraVideo.videoWidth;
+        els.cameraCanvas.height = els.cameraVideo.videoHeight;
+    }
+}
+function toCanvasPoint(point, width, height) {
+    return {
+        x: point.x * width,
+        y: point.y * height
+    };
+}
+function drawPose(landmarks, trackedSide) {
+    syncCanvasToVideo();
+    const context = els.cameraCanvas.getContext('2d');
+    if (!context)
+        return;
+    const width = els.cameraCanvas.width;
+    const height = els.cameraCanvas.height;
+    context.clearRect(0, 0, width, height);
+    if (!landmarks || landmarks.length === 0)
+        return;
+    const side = trackedSide ?? 'left';
+    const indices = side === 'left'
+        ? [11, 23, 25, 27, 29, 31]
+        : [12, 24, 26, 28, 30, 32];
+    const points = indices.map((index) => toCanvasPoint(landmarks[index], width, height));
+    context.strokeStyle = side === 'left' ? '#6dd6ff' : '#ffbe6f';
+    context.lineWidth = 8;
+    context.lineCap = 'round';
+    context.lineJoin = 'round';
+    context.beginPath();
+    context.moveTo(points[0].x, points[0].y);
+    for (let index = 1; index < points.length; index += 1) {
+        context.lineTo(points[index].x, points[index].y);
+    }
+    context.stroke();
+    context.fillStyle = '#f5f7fb';
+    for (const point of points) {
+        context.beginPath();
+        context.arc(point.x, point.y, 7, 0, Math.PI * 2);
+        context.fill();
+    }
+}
+async function stopLiveResources() {
+    if (state.live.rafId !== null) {
+        cancelAnimationFrame(state.live.rafId);
+        state.live.rafId = null;
+    }
+    if (state.live.stream) {
+        for (const track of state.live.stream.getTracks()) {
+            track.stop();
+        }
+        state.live.stream = null;
+    }
+    if (state.live.pose?.close) {
+        await state.live.pose.close();
+    }
+    state.live.pose = null;
+    state.live.engine = null;
+    state.live.sending = false;
+    state.live.paused = false;
+    state.live.pausedAtMs = null;
+    state.live.pausedDurationMs = 0;
+    state.live.snapshot = null;
+    state.live.completionHandled = false;
+    voiceCoach.stop();
+    const context = els.cameraCanvas.getContext('2d');
+    context?.clearRect(0, 0, els.cameraCanvas.width, els.cameraCanvas.height);
+    els.cameraVideo.srcObject = null;
+}
+async function handleSessionComplete(snapshot) {
+    if (!state.activeUser || state.live.completionHandled)
+        return;
+    state.live.completionHandled = true;
+    const durationSeconds = Math.max(1, Math.round((performance.now() - state.live.startedAtMs - state.live.pausedDurationMs) / 1000));
+    const notes = Array.from(new Set(snapshot.results
+        .flatMap((result) => result.feedback)
+        .filter((message) => message.trim() !== ''))).slice(0, 3);
+    const sessionPayload = {
+        completedAt: new Date().toISOString(),
+        durationSeconds,
+        totalReps: snapshot.totalReps,
+        validReps: snapshot.validReps,
+        invalidReps: snapshot.invalidReps,
+        depthScore: snapshot.depthScore,
+        postureScore: snapshot.postureScore,
+        notes,
+        totalSets: squatTraining.session.protocol.sets,
+        repsPerSet: squatTraining.session.protocol.repsPerSet
+    };
+    try {
+        const savedSession = await saveSession(sessionPayload);
+        state.latestSession = savedSession;
+        await refreshUserData();
+    }
+    catch (error) {
+        const fallback = {
+            id: crypto.randomUUID(),
+            userEmail: state.activeUser.email,
+            ...sessionPayload
+        };
+        state.latestSession = fallback;
+        window.alert(error instanceof Error ? error.message : 'The session could not be saved to the backend.');
+    }
+    if (state.latestSession) {
+        renderResults(state.latestSession);
+    }
+    await stopLiveResources();
+    setActiveScreen('results');
+}
+async function handlePoseResults(results) {
+    if (!state.live.engine)
+        return;
+    drawPose(results.poseLandmarks, state.live.snapshot?.trackedSide ?? null);
+    if (state.live.paused) {
+        if (state.live.snapshot)
+            renderLiveSnapshot(state.live.snapshot);
+        return;
+    }
+    const now = performance.now();
+    const update = results.poseLandmarks && results.poseLandmarks.length > 0
+        ? state.live.engine.processLandmarks(results.poseLandmarks, now)
+        : state.live.engine.tickWithoutPose(now);
+    renderLiveSnapshot(update.snapshot);
+    handleEngineEvents(update.events);
+    if (update.snapshot.phase === 'SESSION_COMPLETE') {
+        await handleSessionComplete(update.snapshot);
+    }
+}
+async function startPoseLoop() {
+    const tick = async () => {
+        if (!state.live.pose || !state.live.stream)
+            return;
+        state.live.rafId = requestAnimationFrame(() => {
+            void tick();
+        });
+        if (state.live.sending || els.cameraVideo.readyState < 2)
+            return;
+        state.live.sending = true;
+        try {
+            await state.live.pose.send({ image: els.cameraVideo });
+        }
+        catch (error) {
+            els.cameraError.hidden = false;
+            els.cameraError.textContent = error instanceof Error ? error.message : 'Pose processing failed.';
+        }
+        finally {
+            state.live.sending = false;
+        }
+    };
+    await tick();
+}
+async function startLiveSession() {
+    if (!state.activeUser) {
+        setActiveScreen('auth');
+        return;
+    }
+    await stopLiveResources();
+    setActiveScreen('live');
+    els.cameraError.hidden = true;
+    els.cameraError.textContent = '';
+    if (typeof Pose === 'undefined') {
+        els.cameraError.hidden = false;
+        els.cameraError.textContent = 'MediaPipe Pose could not be loaded in this browser.';
+        return;
+    }
+    try {
+        const stream = await navigator.mediaDevices.getUserMedia({
+            audio: false,
+            video: {
+                facingMode: 'user',
+                width: { ideal: 1280 },
+                height: { ideal: 720 }
             }
         });
-        musicPlayer = audio;
+        state.live.stream = stream;
+        state.live.engine = new SquatSessionEngine(squatTraining.session.protocol);
+        state.live.startedAtMs = performance.now();
+        state.live.pausedDurationMs = 0;
+        state.live.paused = false;
+        state.live.pausedAtMs = null;
+        state.live.snapshot = state.live.engine.getSnapshot();
+        state.live.completionHandled = false;
+        els.cameraVideo.srcObject = stream;
+        await els.cameraVideo.play();
+        syncCanvasToVideo();
+        state.live.pose = new Pose({
+            locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/pose/${file}`
+        });
+        state.live.pose.setOptions({
+            modelComplexity: 1,
+            smoothLandmarks: true,
+            selfieMode: false,
+            enableSegmentation: false,
+            minDetectionConfidence: 0.6,
+            minTrackingConfidence: 0.6
+        });
+        state.live.pose.onResults((results) => {
+            void handlePoseResults(results);
+        });
+        renderLiveSnapshot(state.live.snapshot);
+        voiceCoach.speak({
+            key: 'welcome',
+            message: `Welcome, ${state.activeUser.name}. Today you will perform a squat training: 3 sets of 5 reps. Front camera is live. Get into position.`,
+            interrupt: true,
+            minIntervalMs: 0
+        });
+        await startPoseLoop();
     }
-    return musicPlayer;
-}
-function pickRandomTrack() {
-    if (!MUSIC_TRACKS.length)
-        return null;
-    let idx = Math.floor(Math.random() * MUSIC_TRACKS.length);
-    if (MUSIC_TRACKS.length > 1 && idx === lastMusicIndex) {
-        idx = (idx + 1) % MUSIC_TRACKS.length;
+    catch (error) {
+        els.cameraError.hidden = false;
+        els.cameraError.textContent =
+            error instanceof Error
+                ? error.message
+                : 'Camera access failed. Use a secure session and allow front camera permission.';
     }
-    lastMusicIndex = idx;
-    return MUSIC_TRACKS[idx];
 }
-function playRandomTrack() {
-    const audio = ensureMusicPlayer();
-    const track = pickRandomTrack();
-    if (!audio || !track)
+async function quitLiveSession(nextScreen) {
+    await stopLiveResources();
+    state.latestSession = null;
+    setActiveScreen(nextScreen);
+    renderApp();
+}
+async function handleAuthSubmit(event) {
+    event.preventDefault();
+    const email = els.authEmailInput.value.trim();
+    const password = els.authPasswordInput.value;
+    if (email === '' || password.trim() === '') {
+        showAuthError('Email and password are required.');
         return;
-    audio.src = track;
-    audio.currentTime = 0;
-    audio.muted = state.musicMuted;
-    if (!state.musicMuted) {
-        void audio.play().catch(() => undefined);
     }
-}
-function startMusic() {
-    const audio = ensureMusicPlayer();
-    if (!audio)
-        return;
-    playRandomTrack();
-}
-function pauseMusic(reset = false) {
-    if (!musicPlayer)
-        return;
-    musicPlayer.pause();
-    if (reset) {
-        musicPlayer.currentTime = 0;
+    if (state.authMode === 'signup') {
+        const name = els.authNameInput.value.trim();
+        const sexForTSPU = els.authSexSelect.value === 'male' || els.authSexSelect.value === 'female' ? els.authSexSelect.value : null;
+        if (name === '') {
+            showAuthError('Your name is required.');
+            return;
+        }
+        if (!sexForTSPU) {
+            showAuthError('Sex is required for the FMS setup.');
+            return;
+        }
+        const result = await registerUser(name, email, password, sexForTSPU);
+        if (!result.ok) {
+            showAuthError(result.message ?? 'Could not create the account.');
+            return;
+        }
     }
-}
-function resumeMusic() {
-    if (!musicPlayer || state.musicMuted)
-        return;
-    void musicPlayer.play().catch(() => undefined);
-}
-function updateMusicToggle() {
-    els.musicToggle.classList.toggle('is-muted', state.musicMuted);
-    els.musicToggle.setAttribute('aria-pressed', String(state.musicMuted));
-}
-function setMusicMuted(muted) {
-    state.musicMuted = muted;
-    if (musicPlayer) {
-        musicPlayer.muted = muted;
+    else {
+        const result = await loginUser(email, password);
+        if (!result.ok) {
+            showAuthError(result.message ?? 'Could not log in.');
+            return;
+        }
     }
-    if (!muted && state.status === 'running') {
-        resumeMusic();
-    }
-    updateMusicToggle();
+    await refreshUserData();
+    els.authForm.reset();
+    setActiveScreen('home');
+    renderApp();
 }
+async function bootstrap() {
+    renderApp();
+    try {
+        await refreshUserData();
+        if (state.activeUser) {
+            setActiveScreen('home');
+        }
+        else {
+            state.authMode = 'signup';
+            setActiveScreen('auth');
+        }
+    }
+    catch (error) {
+        showAuthError(error instanceof Error ? error.message : 'Could not reach the backend.');
+        setActiveScreen('auth');
+    }
+    finally {
+        state.bootstrapping = false;
+        renderApp();
+    }
+    els.authSwitchBtn.addEventListener('click', () => {
+        state.authMode = state.authMode === 'signup' ? 'login' : 'signup';
+        renderAuth();
+    });
+    els.authForm.addEventListener('submit', (event) => {
+        void handleAuthSubmit(event);
+    });
+    els.homeProfileBtn.addEventListener('click', () => {
+        setActiveScreen('profile');
+        renderApp();
+    });
+    els.homeNavHome.addEventListener('click', () => {
+        setActiveScreen('home');
+        renderApp();
+    });
+    els.homeNavFms.addEventListener('click', () => {
+        setActiveScreen('fms');
+        renderApp();
+    });
+    els.homeNavProfile.addEventListener('click', () => {
+        setActiveScreen('profile');
+        renderApp();
+    });
+    els.fmsNavHome.addEventListener('click', () => {
+        setActiveScreen('home');
+        renderApp();
+    });
+    els.fmsNavFms.addEventListener('click', () => {
+        setActiveScreen('fms');
+        renderApp();
+    });
+    els.fmsNavProfile.addEventListener('click', () => {
+        setActiveScreen('profile');
+        renderApp();
+    });
+    els.fmsHomeBtn.addEventListener('click', () => {
+        setActiveScreen('home');
+        renderApp();
+    });
+    els.fmsProfileBtn.addEventListener('click', () => {
+        setActiveScreen('profile');
+        renderApp();
+    });
+    els.profileNavHome.addEventListener('click', () => {
+        setActiveScreen('home');
+        renderApp();
+    });
+    els.profileNavFms.addEventListener('click', () => {
+        setActiveScreen('fms');
+        renderApp();
+    });
+    els.profileNavProfile.addEventListener('click', () => {
+        setActiveScreen('profile');
+        renderApp();
+    });
+    els.profileHomeBtn.addEventListener('click', () => {
+        setActiveScreen('home');
+        renderApp();
+    });
+    els.fmsRoot.addEventListener('click', (event) => {
+        const target = event.target;
+        if (!(target instanceof HTMLElement))
+            return;
+        const actionTarget = target.closest('[data-fms-action]');
+        const action = actionTarget?.dataset.fmsAction;
+        if (!action)
+            return;
+        if (action === 'save-sex') {
+            void saveFmsProfileSex();
+            return;
+        }
+        if (action === 'start') {
+            void startFmsFlow();
+            return;
+        }
+        if (action === 'voice') {
+            const task = getCurrentFmsTask();
+            if (!task)
+                return;
+            voiceCoach.speak({
+                key: `fms-manual-${task.id}`,
+                message: task.voiceScript,
+                interrupt: true,
+                minIntervalMs: 0
+            });
+            return;
+        }
+        if (action === 'advance') {
+            void advanceFmsFlow();
+            return;
+        }
+        if (action === 'restart-camera') {
+            const task = getCurrentFmsTask();
+            if (task?.kind === 'movement') {
+                void startFmsMovementCapture(task, 'primary');
+            }
+            return;
+        }
+        if (action === 'retry-capture') {
+            const task = getCurrentFmsTask();
+            if (task?.kind === 'movement') {
+                state.fms.camera.review = null;
+                state.fms.camera.mode = 'primary';
+                renderApp();
+            }
+            return;
+        }
+        if (action === 'retry-heels') {
+            const task = getCurrentFmsTask();
+            if (task?.kind === 'movement') {
+                state.fms.camera.review = null;
+                state.fms.camera.mode = 'heelsElevated';
+                renderApp();
+            }
+            return;
+        }
+        if (action === 'retry-diagonal') {
+            const task = getCurrentFmsTask();
+            if (task?.kind === 'movement') {
+                state.fms.camera.review = null;
+                state.fms.camera.mode = 'diagonalRegression';
+                renderApp();
+            }
+            return;
+        }
+        if (action === 'quit') {
+            if (window.confirm('Save the current FMS progress as incomplete and stop now?')) {
+                void saveAndExitFms('incomplete');
+            }
+        }
+    });
+    els.coachCard.addEventListener('click', () => {
+        setActiveScreen('details');
+        renderApp();
+    });
+    els.detailsBackBtn.addEventListener('click', () => {
+        setActiveScreen('home');
+        renderApp();
+    });
+    els.detailsStartBtn.addEventListener('click', () => {
+        void startLiveSession();
+    });
+    els.quitBtn.addEventListener('click', () => {
+        if (window.confirm('Quit the current session? Current progress will be discarded.')) {
+            void quitLiveSession('details');
+        }
+    });
+    els.pauseToggleBtn.addEventListener('click', () => {
+        if (!state.live.engine)
+            return;
+        if (state.live.paused) {
+            const resumedAt = performance.now();
+            state.live.engine.resume(resumedAt);
+            if (state.live.pausedAtMs !== null) {
+                state.live.pausedDurationMs += resumedAt - state.live.pausedAtMs;
+            }
+            state.live.pausedAtMs = null;
+            state.live.paused = false;
+        }
+        else {
+            state.live.paused = true;
+            state.live.pausedAtMs = performance.now();
+            state.live.engine.pause(state.live.pausedAtMs);
+            voiceCoach.stop();
+        }
+        if (state.live.snapshot)
+            renderLiveSnapshot(state.live.snapshot);
+    });
+    els.resultsHomeBtn.addEventListener('click', () => {
+        state.latestSession = null;
+        setActiveScreen('home');
+        renderApp();
+    });
+    els.resultsProfileBtn.addEventListener('click', async () => {
+        state.latestSession = null;
+        await refreshUserData();
+        setActiveScreen('profile');
+        renderApp();
+    });
+    els.logoutBtn.addEventListener('click', () => {
+        void (async () => {
+            voiceCoach.stop();
+            try {
+                await stopFmsCameraResources({ closeLandmarker: true });
+                await flushTrackedScreenVisit(true);
+                await logoutUser();
+            }
+            catch (error) {
+                window.alert(error instanceof Error ? error.message : 'Could not log out.');
+            }
+            state.activeUser = null;
+            state.sessions = [];
+            state.fmsSessions = [];
+            state.latestSession = null;
+            state.fms.draft = null;
+            state.fms.currentTaskIndex = 0;
+            state.fms.latestSession = null;
+            state.fms.camera.mode = 'primary';
+            state.fms.camera.review = null;
+            state.authMode = 'login';
+            setActiveScreen('auth');
+            renderApp();
+        })();
+    });
+    window.addEventListener('resize', syncCanvasToVideo);
+    window.addEventListener('pagehide', () => {
+        void flushTrackedScreenVisit(true);
+    });
+    document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'hidden') {
+            void flushTrackedScreenVisit(true);
+            return;
+        }
+        resumeTrackedScreenVisit();
+    });
+}
+void bootstrap();
